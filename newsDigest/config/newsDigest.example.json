@@ -1,0 +1,30 @@
+{
+  "enabled": true,
+  "sources": [
+    {
+      "name": "中国新闻网-滚动新闻",
+      "url": "https://www.chinanews.com.cn/scroll-news/news1.html",
+      "extractor": "chinanews",
+      "limit": 60
+    }
+  ],
+  "interest": "关心 AI 与科技新品、消费与价格、健康和居家安全、本地民生政策；不关心体育赛事、娱乐八卦、明星绯闻。",
+  "maxItems": 3,
+  "maxChars": 120,
+  "gemma": {
+    "endpoint": "http://127.0.0.1:8080/v1/chat/completions",
+    "model": "gemma-4-E4B-it-Q4_K_M",
+    "timeoutSeconds": 240
+  },
+  "push": {
+    "channel": "qq",
+    "userOpenid": "YOUR_QQ_OPENID",
+    "allowWakeupFallback": true
+  },
+  "browser": {
+    "node": "node",
+    "extractorScript": "tools\\browserMcp\\extractNews.mjs",
+    "profileDir": "runtime\\browser-profile-digest",
+    "timeoutSeconds": 120
+  }
+}

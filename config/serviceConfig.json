@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "services": {
+    "tts": {
+      "baseURL": "http://127.0.0.1:7862/v1",
+      "management": "external",
+      "model": "breeze",
+      "dialect": "breeze",
+      "timeoutSeconds": 3600,
+      "healthPath": "/health",
+      "apiKeyEnv": "SYNLOVE_TTS_API_KEY",
+      "format": "wav"
+    },
+    "asr": {
+      "baseURL": "http://127.0.0.1:8081/v1",
+      "management": "external",
+      "model": "small",
+      "dialect": "whisper",
+      "timeoutSeconds": 1800,
+      "healthPath": "/health",
+      "apiKeyEnv": "SYNLOVE_ASR_API_KEY"
+    },
+    "llm": {
+      "baseURL": "http://127.0.0.1:8080/v1",
+      "management": "external",
+      "provider": "gemma-local",
+      "model": "gemma-4-E4B-it-Q4_K_M",
+      "timeoutSeconds": 240,
+      "healthPath": "/health",
+      "apiKeyEnv": "SYNLOVE_LLM_API_KEY"
+    }
+  }
+}
