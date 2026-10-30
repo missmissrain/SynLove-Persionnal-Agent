@@ -25,6 +25,8 @@ import { HarnessSessionHost, probe, get_shared_memory, register_timeline_tools, 
 import { QqGateway } from "./gateway.js";
 import { send_qq_media, send_qq_text } from "./send.js";
 import { QqTokenProvider } from "./token.js";
+import { QqOutbox } from "./QqOutbox.js";
+import { QqGatewayLease } from "./QqGatewayLease.js";
 /**
  * 共享会话 id（微信和 QQ 单聊共用同一段上下文）。
  *
@@ -81,13 +83,11 @@ export function apply(ctx, config) {
     /** 每个会话本轮要发出去的内容。 */
     const pending = new Map();
     /** 已经绑定过流监听的会话。 */
-    const bound = new Set();
-    /** 已经注册过 send_file 工具的会话（每个会话只注册一次）。 */
-    const media_bound = new Set();
+    const bound = new WeakSet();
+    let outbox;
     /** 各会话最近一条消息 id（媒体被动回复要用）。 */
     const last_msg = new Map();
     /** 已经装过记忆查询工具（timeline 系列 / relation_query）的 agent ctx。 */
-    const mem_tools_bound = new WeakSet();
     /** 助手回复的落档序号（按会话，保证 id 稳定不重）。 */
     const asst_seq = new Map();
     /** 把一条 QQ 消息写进长期记忆时间线（写入由后台链路做，模型只有读工具）。 */
@@ -114,41 +114,31 @@ export function apply(ctx, config) {
         const suite = get_shared_memory();
         if (suite === undefined)
             return;
-        const target = ctx;
-        if (mem_tools_bound.has(target))
-            return;
-        mem_tools_bound.add(target);
-        try {
-            register_timeline_tools(ctx, suite.timeline);
-            register_graph_tools(ctx, suite.graph);
-        }
-        catch (error) {
-            probe('memory', 'qq.register_tools_failed', { error: String(error) });
-        }
+        register_timeline_tools(ctx, suite.timeline);
+        register_graph_tools(ctx, suite.graph);
     };
     /** 一轮结束（或被取消）时把积累的正文发回 QQ。 */
     const flush = async (session_id) => {
         const item = pending.get(session_id);
-        pending.delete(session_id);
         if (item === undefined || item.text.trim() === '')
             return;
         const seq = (asst_seq.get(session_id) ?? 0) + 1;
         asst_seq.set(session_id, seq);
         record_memory(session_id, 'assistant', item.text.trim(), `qq-asst-${session_id}-${seq}`);
-        const result = await send_qq_text(tokens, item.target, item.text, item.msgId, config.base_url);
-        probe('outbound', 'qq.send', { session_id, mode: result.mode, ok: result.ok, error: result.error ?? '' });
-        if (!result.ok && result.mode === 'passive') {
-            // 被动回复打不出去（可能超过 60 分钟/次数），退回主动推送。
-            const active = await send_qq_text(tokens, item.target, item.text, undefined, config.base_url);
-            probe('outbound', 'qq.send_fallback_active', { session_id, ok: active.ok, error: active.error ?? '' });
+        {
+            get_outbox().enqueue_reply(item);
+            pending.delete(session_id);
+            await get_outbox().drain_queue();
         }
     };
     /** 首次见到某个 agent 时绑定流监听（每个 agent 只绑一次）。 */
     const bind_stream = (agent, session_id) => {
-        if (bound.has(session_id))
+        if (bound.has(agent))
             return;
-        bound.add(session_id);
+        bound.add(agent);
         agent.ctx.on('agent/assistant-stream', (payload) => {
+            if (payload.agent !== undefined && payload.agent !== agent)
+                return;
             const frame = payload.frame;
             if (frame?.type !== 'chunk')
                 return;
@@ -159,7 +149,11 @@ export function apply(ctx, config) {
             if (item !== undefined)
                 item.text += chunk.text;
         });
-        agent.ctx.on('agent/turn-stopping', () => { void flush(session_id); });
+        agent.ctx.on('agent/turn-stopping', (payload) => {
+            if (payload.agent !== undefined && payload.agent !== agent)
+                return;
+            void flush(session_id).catch(error => probe('outbound', 'qq.flush_failed', { error: String(error).slice(0, 160) }));
+        });
     };
     /**
      * 取（或建）会话对应的 Agent。
@@ -212,43 +206,50 @@ export function apply(ctx, config) {
             // 共享会话时微信那边可能已经建好同一个 Agent：先取，取不到再建（否则 create 会"已存在"冲突）。
             const agent = await wait_for_agent(session_id);
             register_query_tools(agent.ctx);
-            // 媒体回传：每个会话注册一次 send_file（捕获目标与最近消息 id）
+            // 微信/QQ 共用 Agent scope；每次入站更新当前通道，不能只按 QQ 的会话集合判重。
             const session_key = String(session_id);
             if (msg_id !== undefined)
                 last_msg.set(session_key, msg_id);
-            if (!media_bound.has(session_key)) {
-                media_bound.add(session_key);
-                agent.ctx.tools.register(defineTool({
-                    name: 'send_file',
-                    description: '把本地图片/视频/语音/文档真正发到当前 QQ 聊天（不是只给路径）。用户说"发我""发过来""截图给我"时用它。',
-                    parameters: {
-                        path: { type: 'string', description: '本地文件绝对路径（20MB 以内）' },
-                    },
-                    output: {
-                        schema: {
-                            type: 'object',
-                            additionalProperties: false,
-                            properties: {
-                                ok: { type: 'boolean', required: true },
-                                text: { type: 'string', required: true },
-                            },
+            const media_tool = defineTool({
+                name: 'send_file',
+                description: '把本地图片/视频/语音/文档真正发到当前 QQ 聊天（不是只给路径）。用户说"发我""发过来""截图给我"时用它。',
+                parameters: {
+                    path: { type: 'string', description: '本地文件绝对路径（20MB 以内）' },
+                },
+                output: {
+                    schema: {
+                        type: 'object',
+                        additionalProperties: false,
+                        properties: {
+                            ok: { type: 'boolean', required: true },
+                            text: { type: 'string', required: true },
                         },
-                        render: (_args, value) => [{ type: 'text', text: value.text }],
                     },
-                    async execute(args) {
-                        const file = String(args.path ?? '').trim();
-                        if (file === '')
-                            return { ok: false, text: 'path 不能为空' };
-                        const result = await send_qq_media(tokens, target, file, last_msg.get(session_key), config.base_url);
-                        if (result.ok)
-                            return { ok: true, text: `已发送：${file}（${result.mode}）` };
-                        return { ok: false, text: `发送失败：${result.error ?? '未知错误'}` };
-                    },
-                }));
+                    render: (_args, value) => [{ type: 'text', text: value.text }],
+                },
+                async execute(args) {
+                    const file = String(args.path ?? '').trim();
+                    if (file === '')
+                        return { ok: false, text: 'path 不能为空' };
+                    const result = await send_qq_media(tokens, target, file, last_msg.get(session_key), config.base_url);
+                    if (result.ok)
+                        return { ok: true, text: `已发送：${file}（${result.mode}）` };
+                    return { ok: false, text: `发送失败：${result.error ?? '未知错误'}` };
+                },
+            });
+            const current = agent.ctx.tools.get('send_file', agent);
+            if (current === undefined) {
+                agent.ctx.tools.register(media_tool);
+            }
+            else {
+                // 注册表保留原定义对象；复用其 effect，仅刷新发送目标与模型可见说明。
+                current.description = media_tool.description;
+                current.parameters = media_tool.parameters;
+                current.execute = media_tool.execute;
             }
             bind_stream(agent, String(session_id));
             pending.set(String(session_id), {
-                text: '',
+                text: pending.get(String(session_id))?.text ?? '',
                 ...msg_id === undefined ? {} : { msgId: msg_id },
                 target,
             });
@@ -267,15 +268,28 @@ export function apply(ctx, config) {
             await send_qq_text(tokens, target, '我这边刚才没处理成，稍后再试一次好吗？', msg_id, config.base_url);
         }
     };
+    /** 无参数；仅当前网关的实际发送链按需打开本地队列。 */
+    const get_outbox = () => {
+        outbox ??= new QqOutbox(process.env.DSH_QQ_OUTBOX ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'qq-outbox.json'), async (row, mark) => {
+            const progress = { sent_parts: row.sent_parts, on_sent: mark };
+            const result = await send_qq_text(tokens, row.target, row.text, row.msgId, config.base_url, progress);
+            if (!result.ok && result.mode === 'passive' && /HTTP 400|HTTP 403/.test(result.error ?? '')) {
+                return send_qq_text(tokens, row.target, row.text, undefined, config.base_url, progress);
+            }
+            return result;
+        }, state => probe('outbound', 'qq.send', state));
+        return outbox;
+    };
     const gateway = new QqGateway({
         token: () => tokens.get(),
         ...config.intents === undefined ? {} : { intents: config.intents },
         ...config.base_url === undefined ? {} : { baseUrl: config.base_url },
         on_event: (event) => { void handle_event(event.t, event.d); },
+        on_health: state => probe('lifecycle', 'qq.health', { ...state, pid: process.pid }),
         log: (message) => { console.error(`[webhook-qq] ${message}`); probe('lifecycle', 'qq.gateway', { message: message.slice(0, 160) }); },
     });
     // 单实例锁：两个 harness 同时连同一个机器人会被平台互相踢（op=7 死循环）。
-    const lock_path = join(homedir(), '.dsh', 'qq-gateway.pid');
+    const lock_path = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'qq-gateway.pid');
     const lock_held = (() => {
         try {
             const pid = Number(readFileSync(lock_path, 'utf8').trim());
@@ -301,11 +315,42 @@ export function apply(ctx, config) {
             probe('lifecycle', 'qq.gateway.skip_duplicate', { pid: process.pid });
             return () => { };
         }
-        writeFileSync(lock_path, String(process.pid), 'utf8');
-        gateway.start();
-        probe('lifecycle', 'qq.gateway.start', {});
+        const home = process.env.DSH_HOME ?? join(homedir(), '.dsh');
+        const lease = new QqGatewayLease(join(home, 'qq-gateway-lease.db'));
+        if (!lease.acquire_lease()) {
+            lease.release_lease();
+            probe('lifecycle', 'qq.gateway.skip_duplicate', { pid: process.pid });
+            return () => { };
+        }
+        let retry;
+        try {
+            writeFileSync(lock_path, String(process.pid), 'utf8');
+            get_outbox();
+            retry = setInterval(() => {
+                void outbox?.drain_queue().catch(error => probe('outbound', 'qq.outbox_failed', { error: String(error).slice(0, 160) }));
+            }, 5_000);
+            void get_outbox().drain_queue().catch(error => probe('outbound', 'qq.outbox_failed', { error: String(error).slice(0, 160) }));
+            gateway.start();
+            probe('lifecycle', 'qq.gateway.start', {});
+        }
+        catch (error) {
+            if (retry !== undefined)
+                clearInterval(retry);
+            outbox?.stop_queue();
+            lease.release_lease();
+            try {
+                if (readFileSync(lock_path, 'utf8').trim() === String(process.pid))
+                    unlinkSync(lock_path);
+            }
+            catch { /* ignore */ }
+            throw error;
+        }
         return () => {
             gateway.stop();
+            if (retry !== undefined)
+                clearInterval(retry);
+            outbox?.stop_queue();
+            lease.release_lease();
             try {
                 if (readFileSync(lock_path, 'utf8').trim() === String(process.pid))
                     unlinkSync(lock_path);

@@ -1,4 +1,7 @@
-"""编码 agent 自修：把「重启和清状态都修不好」的链路故障交给 codex / opencode 改代码。
+"""自修故障提交：由固定 Python 守护脚本直接调用 Codex，隔离修改并自动回滚。
+
+自动修复不依赖 Harness Agent 或微信会话；由 linkSupervisor 直接在后台调用本文件，
+再由本文件直接启动 codex/opencode CLI。所有修改先做快照，静态验证失败立即回滚。
 
 负责的功能：
 - 判断这次故障值不值得动手（冷却、每日上限、同类故障不重复修）；
@@ -59,19 +62,22 @@ def _find_codex() -> Path | None:
     local = os.environ.get("LOCALAPPDATA") or ""
     globbed = sorted(Path(local).glob("OpenAI/Codex/bin/codex.exe")) if local else []
     return _first_existing([os.environ.get("SYNLOVE_CODEX_BIN"), *globbed,
-                            shutil.which("codex")])
+                            shutil.which("codex"), shutil.which("codex.cmd"),
+                            shutil.which("codex.exe"), shutil.which("codex.ps1")])
 
 
 def _find_opencode() -> Path | None:
     """找 opencode：环境变量 → 桌面端自带 CLI → node 全局安装 → PATH。"""
     local = os.environ.get("LOCALAPPDATA") or ""
     candidates = []
+    candidates.append(os.environ.get("SYNLOVE_OPENCODE_BIN"))
     if local:
         candidates += sorted(Path(local).glob("Programs/**/opencode-cli.exe"))
         candidates += sorted(Path(local).glob("Programs/**/opencode.exe"))
         candidates += sorted(Path(local).glob(
             "opencode-ai/node_modules/opencode-windows-x64/bin/opencode.exe"))
-    candidates.append(shutil.which("opencode"))
+    candidates += [shutil.which("opencode"), shutil.which("opencode.cmd"),
+                   shutil.which("opencode.exe"), shutil.which("opencode.ps1")]
     return _first_existing(candidates)
 
 
@@ -88,7 +94,7 @@ FORBIDDEN_PARTS = ("secrets.json", ".env", ".pem", ".key", ".crt", ".pfx")
 
 
 class codeRepair:
-    """把「L0~L3 都救不回来」的故障交给编码 agent，改完验证，不通过就回滚。"""
+    """把「L0~L3 都救不回来」的故障交给固定 CLI，改完验证，不通过就回滚。"""
 
     def __init__(self, root: Path = ROOT_DEFAULT, targets: list[Path] | None = None,
                  timeout: int = 480, cooldown: int = 1800, daily_max: int = 4,
@@ -103,6 +109,7 @@ class codeRepair:
         self.runtime = self.root / "runtime"
         self.state_file = self.runtime / "coderepair.json"
         self.log_file = self.runtime / "coderepair.log"
+        self.lock_file = self.runtime / "coderepair.lock"
         self.timeout = timeout
         self.codex_timeout = codex_timeout
         self.cooldown = cooldown
@@ -112,6 +119,33 @@ class codeRepair:
                                                       self.root / "config",
                                                       PRESET_DEFAULT])]
         self.state = self._load()
+
+    def _acquire_lock(self) -> bool:
+        """创建跨进程自修锁；已有活进程时拒绝重复启动。"""
+        self.runtime.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(self.lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode("ascii"))
+            os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                pid = int(self.lock_file.read_text(encoding="ascii").strip())
+                os.kill(pid, 0)
+                return False
+            except (OSError, ValueError):
+                try:
+                    self.lock_file.unlink()
+                except OSError:
+                    return False
+                return self._acquire_lock()
+
+    def _release_lock(self) -> None:
+        """只删除自修锁文件；异常退出时由下次启动检查 PID 清理。"""
+        try:
+            self.lock_file.unlink()
+        except OSError:
+            pass
 
     # ---------------------------------------------------------------- 状态
 
@@ -251,6 +285,9 @@ class codeRepair:
 
         参数 reason：故障一句话描述；detail：补充证据（日志尾部等）。
         """
+        from LogRedactor import LogRedactor
+        reason = LogRedactor.redact_text(reason)
+        detail = LogRedactor.redact_text(detail)
         whitelist = "\n".join(f"{index + 1}. {path}" for index, path in enumerate(self.targets)
                               if path.exists())
         lines = [
@@ -297,6 +334,9 @@ class codeRepair:
         """
         if command[0].lower().endswith((".cmd", ".bat")):
             command = ["cmd", "/c", *command]
+        elif command[0].lower().endswith(".ps1"):
+            command = ["powershell.exe", "-NoLogo", "-NoProfile",
+                       "-ExecutionPolicy", "Bypass", "-File", *command]
         try:
             result = subprocess.run(command, cwd=str(cwd), timeout=timeout,
                                     stdin=subprocess.DEVNULL, capture_output=True,
@@ -311,7 +351,7 @@ class codeRepair:
         return result.returncode == 0, output
 
     def _codex(self, prompt: str) -> tuple[bool, str]:
-        """codex exec：非交互执行，工作目录限死，沙箱放开（要改 preset 目录）。"""
+        """参数 prompt 为修复提示词；直接启动非交互 Codex，不经过 Agent。"""
         if CODEX_BIN is None:
             return False, "没找到 codex（可设 SYNLOVE_CODEX_BIN 指定路径）"
         return self._run([str(CODEX_BIN), "exec", "--skip-git-repo-check",
@@ -319,10 +359,10 @@ class codeRepair:
                          self.root, self.codex_timeout)
 
     def _opencode(self, prompt: str) -> tuple[bool, str]:
-        """opencode run：v1.19.5 用 --dir 指定工作目录。"""
+        """参数 prompt 为修复提示词；直接启动带 auto 的非交互 OpenCode。"""
         if OPENCODE_BIN is None:
             return False, "没找到 opencode（可设 SYNLOVE_OPENCODE_BIN 指定路径）"
-        return self._run([str(OPENCODE_BIN), "run", "--dir", str(self.root), prompt],
+        return self._run([str(OPENCODE_BIN), "run", "--auto", "--dir", str(self.root), prompt],
                          self.root, self.timeout)
 
     # ---------------------------------------------------------------- 验证
@@ -349,6 +389,11 @@ class codeRepair:
                                         errors="replace", timeout=120)
                 if result.returncode != 0:
                     problems.append(f"{path.name} 语法错误：{(result.stderr or '')[:200]}")
+            elif suffix == ".json":
+                try:
+                    json.loads(path.read_text(encoding="utf-8-sig"))
+                except (OSError, ValueError) as error:
+                    problems.append(f"{path.name} JSON 解析失败：{error}")
             elif suffix in (".yml", ".yaml"):
                 try:
                     import yaml  # noqa: PLC0415 —— 只有改了 yml 才需要
@@ -356,7 +401,8 @@ class codeRepair:
                     problems.append(f"{path.name} 改了但本机没有 PyYAML，无法验证")
                     continue
                 try:
-                    yaml.safe_load(path.read_text(encoding="utf-8"))
+                    # 只校验语法，支持 Harness 自己解释的 !!js，不执行标签内容。
+                    yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
                 except Exception as error:  # noqa: BLE001
                     problems.append(f"{path.name} YAML 解析失败：{error}")
 
@@ -397,41 +443,48 @@ class codeRepair:
         """跑一轮自修。返回 {'ok': bool, 'cli': str, 'changed': [...], 'verify': str}。
 
         参数 reason：故障描述；detail：补充证据（日志尾部）。
-        ok=False 时文件已经回滚，调用方可以放心停机。
+        固定脚本直接执行 CLI；任何 CLI 修改都会经过快照、白名单和静态验证。
         """
+        if not self._acquire_lock():
+            return {"ok": False, "cli": "", "changed": [], "verify": "已有另一轮自修正在运行"}
+        try:
+            return self._attempt_locked(reason, detail)
+        finally:
+            self._release_lock()
+
+    def _attempt_locked(self, reason: str, detail: str = "") -> dict:
+        """在已持有跨进程锁时执行一轮快照、CLI、验证和回滚。"""
         if not self._allowed():
             return {"ok": False, "cli": "", "changed": [], "verify": "未动手（冷却或超上限）"}
-
         self.state["last_at"] = time.time()
         self.state["count_today"] = int(self.state.get("count_today") or 0) + 1
         self._save()
-
         snapshot = self._snapshot()
         if snapshot is None:
             return {"ok": False, "cli": "", "changed": [], "verify": "快照失败，未动手"}
-
         prompt = self._build_prompt(reason, detail)
-        self.log(f"开始自修（第 {self.state['count_today']} 次/今天）：{reason[:100]}")
-
+        from LogRedactor import LogRedactor
+        self.log(f"开始自修（第 {self.state['count_today']} 次/今天）："
+                 f"{LogRedactor.redact_text(reason)[:100]}")
         used = ""
         output = ""
         for name in self.cli_chain:
             if name == "codex":
                 ok, output = self._codex(prompt)
-            else:
+            elif name == "opencode":
                 ok, output = self._opencode(prompt)
+            else:
+                self.log(f"未知 CLI：{name}，跳过")
+                continue
             used = name
             self.log(f"{name} 退出：{'成功' if ok else '失败'}；输出尾部 {output[-300:]}")
             diff = self._diff(snapshot)
             if ok and (diff["changed"] or diff["created"]):
                 break
-            if not ok:
-                self.log(f"{name} 没成功，换下一个")
         else:
             self._restore(snapshot, self._diff(snapshot))
-            self._record(False, used, [], "所有 CLI 都失败")
-            return {"ok": False, "cli": used, "changed": [], "verify": "所有 CLI 都失败"}
-
+            self._record(False, used, [], "所有 CLI 都失败或未产生改动")
+            return {"ok": False, "cli": used, "changed": [], "verify": "所有 CLI 都失败或未产生改动"}
         diff = self._diff(snapshot)
         passed, verify = self._verify(diff)
         changed = diff["changed"] + diff["created"]
@@ -440,8 +493,6 @@ class codeRepair:
             self._restore(snapshot, diff)
             self._record(False, used, changed, verify)
             return {"ok": False, "cli": used, "changed": changed, "verify": verify}
-
-        # 快照留着，方便事后对比；只保留最近 3 份
         self._prune_snapshots()
         self._record(True, used, changed, verify)
         return {"ok": True, "cli": used, "changed": changed, "verify": verify}

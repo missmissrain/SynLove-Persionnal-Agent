@@ -33,7 +33,7 @@ export function split_text(text, limit = CHUNK_CHARS) {
  * @param baseUrl - 接口基址
  * @returns 发送结果（不抛异常，便于调用方记录并降级）
  */
-export async function send_qq_text(tokenProvider, target, text, msgId, baseUrl = 'https://api.bot.qq.com') {
+export async function send_qq_text(tokenProvider, target, text, msgId, baseUrl = 'https://api.bot.qq.com', progress) {
     const chunks = split_text(text);
     if (chunks.length === 0)
         return { ok: true, mode: msgId === undefined ? 'active' : 'passive' };
@@ -47,6 +47,8 @@ export async function send_qq_text(tokenProvider, target, text, msgId, baseUrl =
     const mode = msgId === undefined ? 'active' : 'passive';
     let lastId;
     for (const [index, chunk] of chunks.entries()) {
+        if (progress?.sent_parts.includes(index))
+            continue;
         const body = { content: chunk, msg_type: 0 };
         if (msgId !== undefined) {
             body.msg_id = msgId;
@@ -63,6 +65,7 @@ export async function send_qq_text(tokenProvider, target, text, msgId, baseUrl =
             const raw = await response.text();
             if (!response.ok)
                 return { ok: false, mode, error: `HTTP ${response.status} ${raw.slice(0, 160)}` };
+            progress?.on_sent(index);
             try {
                 const parsed = JSON.parse(raw);
                 if (typeof parsed.id === 'string')

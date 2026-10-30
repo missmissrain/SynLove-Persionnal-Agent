@@ -205,6 +205,7 @@ export class WeixinConnector {
   private readonly opencode_watcher: OpencodeWatcher
   private readonly controller = new AbortController()
   private readonly stream_disposers = new Map<string, () => void>()
+  private readonly stream_agents = new Map<string, Agent>()
   private readonly observation_disposers: Array<() => void>
   /** 每个 Stream 的工具调用计数（用于"每 N 次工具调用推一次摘要"）。 */
   private readonly tool_calls_seen = new Map<string, Set<string>>()
@@ -382,6 +383,7 @@ export class WeixinConnector {
       store: this.store,
       turn_context: this.turn_context,
       sender: async input => {
+        if (!this.lease.is_held()) throw new Error('微信消费者所有权已丢失，停止发送')
         await this.client.send_message_with_retry({
           to_user_id: input.user_id,
           text: input.text,
@@ -458,8 +460,10 @@ export class WeixinConnector {
       enqueue_outbound: input => { this.outbound.enqueue_notice(input) },
       // 媒体回传：iLink 目前只提供 send_image（图片），文件类走文本提示
       send_media: async (user_id, path, context_token) => {
+        if (!this.lease.is_held()) throw new Error('微信消费者所有权已丢失，停止发送媒体')
         const { readFile } = await import('node:fs/promises')
         const data = new Uint8Array(await readFile(path))
+        if (!this.lease.is_held()) throw new Error('微信消费者所有权已丢失，停止发送媒体')
         await this.client.send_image({
           to_user_id: user_id,
           data,
@@ -767,15 +771,23 @@ export class WeixinConnector {
    * 失败会在这里暴露（而不是等到用户下一条消息才发现 bot 不回话了），
    * 验证完立刻释放并删掉探针会话文件，不留痕迹。
    */
-  private async reload_preset(): Promise<{ reloaded: boolean }> {
+  private async reload_preset(): Promise<{ reloaded: boolean; routing_checked: boolean }> {
     this.host.reset_composition()
     const probe_id = `preset-check-${Date.now().toString(36)}`
     let failure = ''
     try {
-      await this.host.create_agent(brandString<SessionId>(probe_id))
+      const agent = await this.host.create_agent(brandString<SessionId>(probe_id))
+      // 复现真实的 QQ 先注册、微信后绑定路径；不注入消息、不调用模型、不外发。
+      if (this.timeline !== undefined) {
+        register_timeline_tools(agent.ctx, this.timeline)
+        register_graph_tools(agent.ctx, this.graph)
+      }
+      this.bind_agent_stream(agent)
+      this.bind_agent_stream(agent)
     } catch (error) {
       failure = error instanceof Error ? error.message : String(error)
     } finally {
+      this.forget_session(probe_id)
       await this.host.dispose_agent(probe_id)
       delete_session_artifacts({ root: sessions_root(), cwd: this.workspace_path, id: probe_id })
     }
@@ -784,7 +796,7 @@ export class WeixinConnector {
       throw new Error(`preset 组装失败，已回滚：${failure}`)
     }
     probe('lifecycle', 'preset.reloaded', {})
-    return { reloaded: true }
+    return { reloaded: true, routing_checked: true }
   }
 
   /** 丢掉某个会话在内存里的残留状态（上下文已经清掉，这些映射不能再留着）。 */
@@ -795,6 +807,7 @@ export class WeixinConnector {
       probe('lifecycle', 'context.dispose_failed', { session_id, error: String(error) })
     }
     this.stream_disposers.delete(session_id)
+    this.stream_agents.delete(session_id)
     this.tool_calls_seen.delete(session_id)
     this.current_turn.delete(session_id)
     this.last_progress_at.delete(session_id)
@@ -978,10 +991,18 @@ export class WeixinConnector {
     /** 游标连续被卡住的次数；用于退避，避免服务端立刻重投造成热循环。 */
     let cursor_stall = 0
     while (!this.controller.signal.aborted && !this.stopped) {
+      if (!this.lease.is_held()) {
+        this.controller.abort()
+        this.outbound.stop()
+        await this.inbound.dispose()
+        probe('lifecycle', 'lease.lost_stop')
+        return
+      }
       // 队列里有待发送的，顺手泵一次（不依赖新消息触发）。
       void this.outbound.drain()
       const cursor = this.store.get_cursor()
       const result = await this.ingress.poll(cursor, this.controller.signal)
+      if (!this.lease.is_held()) continue
 
       switch (result.kind) {
         case 'messages': {
@@ -1049,7 +1070,8 @@ export class WeixinConnector {
   /** 桥接 assistant-stream：聚合成正文、按 turn 绑定上下文、驱动进度/心跳。 */
   private bind_agent_stream(agent: Agent): void {
     const session_id = String(agent.id)
-    if (this.stream_disposers.has(session_id)) return
+    if (this.stream_agents.get(session_id) === agent) return
+    this.stream_disposers.get(session_id)?.()
     // 长期记忆的读取工具装在**这个 agent 自己**的 ctx 上（用 agent.ctx.effect 保证随 agent 卸载清理）。
     // 只装"读"：写入由链路自动完成，不开放给模型，避免它把臆想的事实写进长期记忆。
     if (this.timeline !== undefined) {
@@ -1133,6 +1155,7 @@ export class WeixinConnector {
       dispose_compaction()
       ObservationRecorder.forget_session(session_id)
     })
+    this.stream_agents.set(session_id, agent)
     probe('lifecycle', 'stream.bound', { session_id })
   }
 
@@ -1627,6 +1650,8 @@ export class WeixinConnector {
     this.graph_scheduler = undefined
     for (const dispose of this.stream_disposers.values()) dispose()
     this.stream_disposers.clear()
+    this.stream_agents.clear()
+    await this.inbound.dispose()
     this.aggregators.clear()
     this.tool_calls_seen.clear()
     // 尽力把队列里剩下的发出去，再释放所有权。

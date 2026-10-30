@@ -59,6 +59,7 @@ export async function send_qq_text(
   text: string,
   msgId?: string,
   baseUrl = 'https://api.bot.qq.com',
+  progress?: { sent_parts: readonly number[]; on_sent: (index: number) => void },
 ): Promise<QqSendResult> {
   const chunks = split_text(text)
   if (chunks.length === 0) return { ok: true, mode: msgId === undefined ? 'active' : 'passive' }
@@ -72,6 +73,7 @@ export async function send_qq_text(
   const mode = msgId === undefined ? 'active' : 'passive'
   let lastId: string | undefined
   for (const [index, chunk] of chunks.entries()) {
+    if (progress?.sent_parts.includes(index)) continue
     const body: Record<string, unknown> = { content: chunk, msg_type: 0 }
     if (msgId !== undefined) {
       body.msg_id = msgId
@@ -87,6 +89,7 @@ export async function send_qq_text(
       })
       const raw = await response.text()
       if (!response.ok) return { ok: false, mode, error: `HTTP ${response.status} ${raw.slice(0, 160)}` }
+      progress?.on_sent(index)
       try {
         const parsed = JSON.parse(raw) as { id?: string }
         if (typeof parsed.id === 'string') lastId = parsed.id

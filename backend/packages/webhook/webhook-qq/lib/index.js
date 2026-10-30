@@ -1,10 +1,13 @@
-import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { brandString } from "@deepseek-ai/dsh-brand";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { HarnessSessionHost, get_shared_memory, probe, register_graph_tools, register_timeline_tools } from "@deepseek-ai/dsh-webhook-weixin";
+import { randomUUID } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
+import { execFileSync } from "node:child_process";
 //#region ../../../vendor/cosmokit/src/misc.ts
 /** Return true when a value is `null` or `undefined`. */
 function isNullable(value) {
@@ -798,102 +801,119 @@ defineMethod("transform", [
 ], ({ inner }, isInner) => inner.toString(isInner));
 //#endregion
 //#region lib/types/gateway.js
-/**
-* QQ 机器人 WebSocket 网关（官方 v2）。
-*
-* 流程：`GET /gateway` 取 wss 地址 → 连上后收 `op=10 Hello`（带心跳间隔）→
-* 发 `op=2 Identify`（`token = "QQBot <access_token>"` + intents + shard）→
-* 按间隔发 `op=1 心跳` → 收 `op=0 Dispatch` 业务事件。
-*
-* 断线处理：`op=7 Reconnect` 或 socket 关闭 → 指数退避重连，优先 `op=6 Resume`
-* （带上次的 session_id + seq，平台会补发漏掉的事件）。
-*
-* @module dsh-webhook-qq/gateway
-*/
-/** 默认订阅：群 @ + C2C 单聊消息。 */
-const DEFAULT_INTENTS = 1 << 25;
-/** WebSocket 网关客户端。 */
 var QqGateway = class {
 	options;
 	socket;
 	heartbeat;
+	handshake;
+	reconnect;
+	controller;
 	seq = 0;
 	sessionId = "";
-	stopped = false;
+	stopped = true;
 	attempt = 0;
-	/** 连续被平台踢（op=7）的时间戳；短时间内太多就冷却，避免无限重连战争。 */
-	kickTimes = [];
-	/** 冷却截止时间（毫秒时间戳）；期间不重连。 */
-	cooldownUntil = 0;
+	generation = 0;
+	awaiting_ack = false;
+	ready = false;
+	interval_ms = 3e4;
+	kick_times = [];
+	cooldown_until = 0;
+	/** options 指定鉴权和事件处理；构造不联网。 */
 	constructor(options) {
 		this.options = options;
 	}
-	/** 启动（立即连接，断线自动重连）。 */
+	/** 无参数；幂等启动一个连接生命周期。 */
 	start() {
+		if (!this.stopped) return;
 		this.stopped = false;
 		this.connect();
 	}
-	/** 停止（不再重连）。 */
+	/** 无参数；取消资源并使旧异步回调失效。 */
 	stop() {
 		this.stopped = true;
-		if (this.heartbeat !== void 0) clearInterval(this.heartbeat);
-		this.heartbeat = void 0;
-		try {
-			this.socket?.close();
-		} catch {}
-		this.socket = void 0;
+		this.generation++;
+		this.clear_connection();
+		this.ready = false;
+		if (this.reconnect !== void 0) clearTimeout(this.reconnect);
+		this.reconnect = void 0;
+		this.health("stopped");
 	}
-	/** 建一次连接；失败就按退避重试。 */
+	/** phase 为阶段；以实际心跳周期计算健康证据有效期。 */
+	health(phase) {
+		this.options.on_health?.({
+			phase,
+			expires_at: Date.now() + Math.max(3e4, this.interval_ms * 2 + 5e3)
+		});
+	}
+	/** 无参数；释放连接资源，不负责重连。 */
+	clear_connection() {
+		if (this.heartbeat !== void 0) clearInterval(this.heartbeat);
+		if (this.handshake !== void 0) clearTimeout(this.handshake);
+		this.heartbeat = void 0;
+		this.handshake = void 0;
+		this.controller?.abort();
+		this.controller = void 0;
+		const socket = this.socket;
+		this.socket = void 0;
+		try {
+			socket?.close();
+		} catch (error) {
+			this.options.log?.(`gateway 关闭失败：${String(error).slice(0, 80)}`);
+		}
+	}
+	/** gen 为连接代次，reason 为原因；当前连接最多安排一个重连。 */
+	fail_connection(gen, reason) {
+		if (this.stopped || gen !== this.generation) return;
+		this.generation++;
+		this.ready = false;
+		this.clear_connection();
+		this.health("reconnecting");
+		const delay = Math.max(this.cooldown_until - Date.now(), Math.min(3e4, 1e3 * 2 ** Math.min(this.attempt++, 5)));
+		this.options.log?.(`gateway ${reason}，${Math.round(delay / 1e3)}s 后重连`);
+		if (this.reconnect !== void 0) clearTimeout(this.reconnect);
+		this.reconnect = setTimeout(() => {
+			this.reconnect = void 0;
+			if (!this.stopped) this.connect();
+		}, delay);
+	}
+	/** 无参数；令牌、取地址、WebSocket 握手共用同一取消与超时边界。 */
 	async connect() {
 		if (this.stopped) return;
-		const log = this.options.log ?? (() => {});
+		const gen = ++this.generation;
+		const live = () => !this.stopped && gen === this.generation;
+		this.controller = new AbortController();
+		const signal = this.controller.signal;
+		this.health("connecting");
+		this.handshake = setTimeout(() => this.fail_connection(gen, "握手超时"), this.options.handshake_timeout_ms ?? 3e4);
 		try {
-			const base = this.options.baseUrl ?? "https://api.bot.qq.com";
 			const token = await this.options.token();
-			const response = await fetch(`${base}/gateway`, {
+			if (!live()) return;
+			const response = await fetch(`${this.options.baseUrl ?? "https://api.bot.qq.com"}/gateway`, {
 				headers: { Authorization: `QQBot ${token}` },
-				signal: AbortSignal.timeout(15e3)
+				signal
 			});
 			if (!response.ok) throw new Error(`GET /gateway HTTP ${response.status}`);
 			const body = await response.json();
-			if (typeof body.url !== "string" || body.url === "") throw new Error("GET /gateway 没返回 url");
+			if (!live()) return;
+			if (!body.url) throw new Error("GET /gateway 没返回 url");
 			const socket = new WebSocket(body.url);
 			this.socket = socket;
 			socket.addEventListener("open", () => {
-				log("gateway 已连接");
+				if (live()) this.options.log?.("gateway 已连接");
 			});
 			socket.addEventListener("message", (event) => {
-				this.handle_frame(typeof event.data === "string" ? event.data : String(event.data));
+				if (!live()) return;
+				this.handle_frame(String(event.data), gen).catch((error) => this.fail_connection(gen, `处理帧失败：${String(error).slice(0, 120)}`));
 			});
-			socket.addEventListener("close", () => {
-				if (this.heartbeat !== void 0) clearInterval(this.heartbeat);
-				this.heartbeat = void 0;
-				if (this.stopped) return;
-				const backoff = Math.min(3e4, 1e3 * 2 ** this.attempt);
-				const cooldown = Math.max(0, this.cooldownUntil - Date.now());
-				const delay = Math.max(backoff, cooldown);
-				this.attempt += 1;
-				log(`gateway 断开，${Math.round(delay / 1e3)}s 后重连（第 ${this.attempt} 次）`);
-				setTimeout(() => {
-					this.connect();
-				}, delay);
-			});
-			socket.addEventListener("error", () => {
-				log("gateway 连接错误（等 close 后重连）");
-			});
+			socket.addEventListener("close", () => this.fail_connection(gen, "断开"));
+			socket.addEventListener("error", () => this.fail_connection(gen, "连接错误"));
 		} catch (error) {
-			if (this.stopped) return;
-			const delay = Math.min(3e4, 1e3 * 2 ** this.attempt);
-			this.attempt += 1;
-			log(`gateway 连接失败：${String(error).slice(0, 120)}；${Math.round(delay / 1e3)}s 后重试`);
-			setTimeout(() => {
-				this.connect();
-			}, delay);
+			this.fail_connection(gen, `连接失败：${String(error).slice(0, 120)}`);
 		}
 	}
-	/** 处理一帧：hello / dispatch / 心跳确认 / 重连 / 失效会话。 */
-	async handle_frame(raw) {
-		const log = this.options.log ?? (() => {});
+	/** raw 为协议帧，gen 为连接代次；确认和业务事件只作用于当前连接。 */
+	async handle_frame(raw, gen = this.generation) {
+		if (this.stopped || gen !== this.generation) return;
 		let frame;
 		try {
 			frame = JSON.parse(raw);
@@ -903,75 +923,82 @@ var QqGateway = class {
 		switch (frame.op) {
 			case 10: {
 				const interval = Number(frame.d?.heartbeat_interval ?? 3e4);
-				this.start_heartbeat(interval);
-				await this.identify();
+				if (!Number.isFinite(interval) || interval < 1e3) throw new Error("心跳间隔无效");
+				this.start_heartbeat(interval, gen);
+				await this.identify(gen);
 				return;
 			}
-			case 11: return;
-			case 0: {
+			case 11:
+				this.awaiting_ack = false;
+				this.health(this.ready ? "healthy" : "connecting");
+				return;
+			case 0:
 				if (typeof frame.s === "number") this.seq = frame.s;
-				const kind = frame.t;
-				if (kind === "READY") {
-					const session = frame.d?.session_id;
-					if (typeof session === "string") this.sessionId = session;
+				if (frame.t === "READY" || frame.t === "RESUMED") {
+					const id = frame.d?.session_id;
+					if (id) this.sessionId = id;
+					if (this.handshake !== void 0) clearTimeout(this.handshake);
+					this.handshake = void 0;
+					this.ready = true;
 					this.attempt = 0;
-					log("gateway READY");
-					return;
-				}
-				if (kind === "C2C_MESSAGE_CREATE" || kind === "GROUP_AT_MESSAGE_CREATE") this.options.on_event({
-					t: kind,
+					this.health("ready");
+					this.options.log?.("gateway READY");
+				} else if (frame.t === "C2C_MESSAGE_CREATE" || frame.t === "GROUP_AT_MESSAGE_CREATE") this.options.on_event({
+					t: frame.t,
 					d: frame.d ?? {}
 				});
 				return;
-			}
-			case 7: {
-				log("gateway 要求重连（op=7），清空会话后重新 identify");
-				this.sessionId = "";
-				this.seq = 0;
-				const now = Date.now();
-				this.kickTimes = this.kickTimes.filter((at) => now - at < 600 * 1e3);
-				this.kickTimes.push(now);
-				if (this.kickTimes.length >= 5) {
-					this.cooldownUntil = now + 300 * 1e3;
-					this.kickTimes = [];
-					log("gateway 连续被踢 5 次，冷却 5 分钟后再连（避免重连战争）");
+			case 7:
+				this.kick_times = this.kick_times.filter((at) => Date.now() - at < 6e5);
+				this.kick_times.push(Date.now());
+				if (this.kick_times.length >= 5) {
+					this.cooldown_until = Date.now() + 3e5;
+					this.kick_times = [];
 				}
-				try {
-					this.socket?.close();
-				} catch {}
+				this.fail_connection(gen, "要求重连（op=7）");
 				return;
-			}
 			case 9:
-				log("gateway 会话失效（op=9），重新 identify");
 				this.sessionId = "";
 				this.seq = 0;
-				await this.identify();
+				this.fail_connection(gen, "会话失效（op=9）");
 				return;
 			default: return;
 		}
 	}
-	/** 启动心跳（d 带上次的 seq）。 */
-	start_heartbeat(interval) {
+	/** interval 为心跳周期，gen 为连接代次；确认超时立即废弃旧连接。 */
+	start_heartbeat(interval, gen) {
 		if (this.heartbeat !== void 0) clearInterval(this.heartbeat);
+		this.interval_ms = interval;
+		this.awaiting_ack = false;
 		const send = () => {
+			if (this.stopped || gen !== this.generation) return;
+			if (this.awaiting_ack) {
+				this.fail_connection(gen, "心跳确认超时");
+				return;
+			}
 			try {
-				this.socket?.send(JSON.stringify({
+				if (this.socket?.readyState !== WebSocket.OPEN) throw new Error("socket 未打开");
+				this.socket.send(JSON.stringify({
 					op: 1,
 					d: this.seq
 				}));
-			} catch {}
+				this.awaiting_ack = true;
+			} catch (error) {
+				this.fail_connection(gen, `心跳发送失败：${String(error).slice(0, 80)}`);
+			}
 		};
 		send();
-		this.heartbeat = setInterval(send, Math.max(5e3, interval));
+		if (!this.stopped && gen === this.generation) this.heartbeat = setInterval(send, interval);
 	}
-	/** 发 identify / resume。 */
-	async identify() {
+	/** gen 为所属连接代次；取令牌后再核验代次，防止 stop 后复活。 */
+	async identify(gen) {
 		const token = await this.options.token();
+		if (this.stopped || gen !== this.generation) return;
 		const payload = this.sessionId === "" ? {
 			op: 2,
 			d: {
 				token: `QQBot ${token}`,
-				intents: this.options.intents ?? DEFAULT_INTENTS,
+				intents: this.options.intents ?? 1 << 25,
 				shard: [0, 1],
 				properties: {}
 			}
@@ -983,11 +1010,7 @@ var QqGateway = class {
 				seq: this.seq
 			}
 		};
-		try {
-			this.socket?.send(JSON.stringify(payload));
-		} catch (error) {
-			(this.options.log ?? (() => {}))(`gateway 发送 ${this.sessionId === "" ? "identify" : "resume"} 失败：${String(error).slice(0, 100)}`);
-		}
+		this.socket?.send(JSON.stringify(payload));
 	}
 };
 //#endregion
@@ -1025,7 +1048,7 @@ function split_text(text, limit = CHUNK_CHARS) {
 * @param baseUrl - 接口基址
 * @returns 发送结果（不抛异常，便于调用方记录并降级）
 */
-async function send_qq_text(tokenProvider, target, text, msgId, baseUrl = "https://api.bot.qq.com") {
+async function send_qq_text(tokenProvider, target, text, msgId, baseUrl = "https://api.bot.qq.com", progress) {
 	const chunks = split_text(text);
 	if (chunks.length === 0) return {
 		ok: true,
@@ -1040,6 +1063,7 @@ async function send_qq_text(tokenProvider, target, text, msgId, baseUrl = "https
 	const mode = msgId === void 0 ? "active" : "passive";
 	let lastId;
 	for (const [index, chunk] of chunks.entries()) {
+		if (progress?.sent_parts.includes(index)) continue;
 		const body = {
 			content: chunk,
 			msg_type: 0
@@ -1065,6 +1089,7 @@ async function send_qq_text(tokenProvider, target, text, msgId, baseUrl = "https
 				mode,
 				error: `HTTP ${response.status} ${raw.slice(0, 160)}`
 			};
+			progress?.on_sent(index);
 			try {
 				const parsed = JSON.parse(raw);
 				if (typeof parsed.id === "string") lastId = parsed.id;
@@ -1278,6 +1303,206 @@ var QqTokenProvider = class {
 	}
 };
 //#endregion
+//#region lib/types/QqOutbox.js
+/**
+* QQ 持久发送队列：先原子落盘再发送，逐段记录成功结果，失败保留并有界重试。
+* 参数：path 为独立队列文件；send 为发送函数；report 为状态回调。每条最多重试 5 次。
+* 同一个网关实例拥有该文件；已确认发送的段不会再次发送，未知网络结果仍可能重复。
+*/
+var QqOutbox = class {
+	path;
+	send;
+	report;
+	rows = [];
+	draining = false;
+	stopped = false;
+	/** path 为队列文件，send 接收消息与分段确认回调，report 只报告脱敏元数据。 */
+	constructor(path, send, report) {
+		this.path = path;
+		this.send = send;
+		this.report = report;
+		if (!existsSync(path)) return;
+		const data = JSON.parse(readFileSync(path, "utf8"));
+		if (data.version !== 1 || !Array.isArray(data.rows) || data.rows.some((row) => typeof row.id !== "string" || typeof row.text !== "string" || !Array.isArray(row.sent_parts) || typeof row.attempt !== "number" || typeof row.next_at !== "number" || !row.target || !["pending", "failed_terminal"].includes(row.status))) throw new Error("QQ outbox 文件格式无效，原文件已保留");
+		this.rows = data.rows;
+	}
+	/** 无参数；写入临时文件后原子替换，私聊正文只保存在本地状态目录。 */
+	save_rows() {
+		mkdirSync(dirname(this.path), { recursive: true });
+		const temp = `${this.path}.${process.pid}.tmp`;
+		writeFileSync(temp, JSON.stringify({
+			version: 1,
+			rows: this.rows
+		}), {
+			mode: 384,
+			flush: true
+		});
+		renameSync(temp, this.path);
+	}
+	/** reply 为完整待发回复；持久化失败会抛出，调用方不得删除内存回复。 */
+	enqueue_reply(reply) {
+		if (reply.msgId !== void 0) {
+			const duplicate = this.rows.find((row) => row.msgId === reply.msgId && JSON.stringify(row.target) === JSON.stringify(reply.target) && row.text === reply.text && row.status !== "failed_terminal");
+			if (duplicate !== void 0) return duplicate.id;
+		}
+		if (this.rows.length >= 1024) throw new Error("QQ outbox 已满，待发消息未删除");
+		const row = {
+			...reply,
+			id: randomUUID(),
+			attempt: 0,
+			next_at: 0,
+			status: "pending",
+			sent_parts: []
+		};
+		this.rows.push(row);
+		try {
+			this.save_rows();
+		} catch (error) {
+			this.rows.pop();
+			throw error;
+		}
+		return row.id;
+	}
+	/** 无参数；串行发送到期消息，失败保留，防止相同目标后续消息越过失败记录。 */
+	async drain_queue() {
+		if (this.draining || this.stopped) return;
+		this.draining = true;
+		const blocked = /* @__PURE__ */ new Set();
+		try {
+			for (const row of [...this.rows]) {
+				if (this.stopped) break;
+				if (row.status === "failed_terminal") continue;
+				const target = JSON.stringify(row.target);
+				if (blocked.has(target)) continue;
+				if (row.next_at > Date.now()) {
+					blocked.add(target);
+					continue;
+				}
+				let result;
+				try {
+					result = await this.send(row, (index) => {
+						if (!row.sent_parts.includes(index)) row.sent_parts.push(index);
+						this.save_rows();
+					});
+				} catch (error) {
+					result = {
+						ok: false,
+						mode: "passive",
+						error: String(error).slice(0, 160)
+					};
+				}
+				if (result.ok) this.rows.splice(this.rows.indexOf(row), 1);
+				else {
+					row.attempt++;
+					row.error = result.error ?? "发送失败";
+					row.next_at = Date.now() + Math.min(3e5, 5e3 * 2 ** row.attempt);
+					if (row.attempt >= 5) row.status = "failed_terminal";
+					blocked.add(target);
+				}
+				this.save_rows();
+				this.report({
+					outbound_id: row.id,
+					ok: result.ok,
+					status: result.ok ? "sent" : row.status,
+					attempt: row.attempt
+				});
+			}
+		} finally {
+			this.draining = false;
+		}
+	}
+	/** 无参数；停止取新任务，已经在途的发送仍可持久记录结果。 */
+	stop_queue() {
+		this.stopped = true;
+	}
+};
+//#endregion
+//#region lib/types/QqGatewayLease.js
+/**
+* QQ 网关原子互斥：SQLite 事务裁决所有权，PID 文件仅供界面读取。
+* 参数 path 为独立租约库路径；无账号信息。存活且启动时刻一致的持有者不得被抢占。
+*/
+/** pid 为进程号；仅判断该进程是否存在。 */
+function is_pid_alive(pid) {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return error.code === "EPERM";
+	}
+}
+/** pid 为进程号；读取进程启动时刻，权限不足时返回 undefined。 */
+function process_started_at(pid) {
+	try {
+		if (process.platform === "win32") {
+			const out = execFileSync("powershell.exe", [
+				"-NoLogo",
+				"-NoProfile",
+				"-Command",
+				`[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($p) { Write-Output ([DateTimeOffset]$p.StartTime).ToUnixTimeMilliseconds() }`
+			], {
+				encoding: "utf8",
+				timeout: 5e3,
+				windowsHide: true
+			});
+			const value = Number(out.trim());
+			return Number.isFinite(value) && value > 0 ? value : void 0;
+		}
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const ticks = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]);
+		const boot = Number(readFileSync("/proc/stat", "utf8").split("\n").find((line) => line.startsWith("btime "))?.split(" ")[1]);
+		return Number.isFinite(ticks) && Number.isFinite(boot) ? (boot + ticks / 100) * 1e3 : void 0;
+	} catch {
+		return;
+	}
+}
+/** pid 与记录的启动时刻匹配时视为活跃持有者，防止 PID 回收误判。 */
+function lease_holder_alive(pid, recorded_started_at) {
+	if (!is_pid_alive(pid)) return false;
+	const actual = process_started_at(pid);
+	return actual === void 0 || Math.abs(actual - recorded_started_at) <= 6e4;
+}
+var QqGatewayLease = class {
+	db;
+	owner = randomUUID();
+	closed = false;
+	/** path 为租约库文件；仅初始化锁表，不创建网关连接。 */
+	constructor(path) {
+		mkdirSync(dirname(path), { recursive: true });
+		this.db = new DatabaseSync(path);
+		this.db.exec("PRAGMA busy_timeout=5000");
+		this.db.exec("CREATE TABLE IF NOT EXISTS gateway_lease(id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT, pid INTEGER, started_at INTEGER)");
+		const version = Number(this.db.prepare("PRAGMA user_version").get()?.user_version ?? 0);
+		if (version === 0) this.db.exec("PRAGMA user_version=1");
+		else if (version !== 1) throw new Error(`QQ lease schema 版本不匹配：${version}`);
+	}
+	/** 无参数；单个事务核对活进程并获取租约，冲突返回 false。 */
+	acquire_lease() {
+		if (this.closed) throw new Error("QQ lease 已关闭");
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			const row = this.db.prepare("SELECT pid,started_at FROM gateway_lease WHERE id=1").get();
+			if (row && lease_holder_alive(row.pid, row.started_at)) {
+				this.db.exec("COMMIT");
+				return false;
+			}
+			this.db.prepare("INSERT INTO gateway_lease VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET owner=excluded.owner,pid=excluded.pid,started_at=excluded.started_at").run(this.owner, process.pid, Date.now() - Math.round(process.uptime() * 1e3));
+			this.db.exec("COMMIT");
+			return true;
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		}
+	}
+	/** 无参数；仅释放自己的租约并关闭连接，重复释放无副作用。 */
+	release_lease() {
+		if (this.closed) return;
+		this.db.prepare("DELETE FROM gateway_lease WHERE owner=?").run(this.owner);
+		this.db.close();
+		this.closed = true;
+	}
+};
+//#endregion
 //#region lib/types/index.js
 /**
 * QQ 官方机器人通道（Cordis 函数式插件）——**与微信通道并存**，互不影响。
@@ -1356,13 +1581,11 @@ function apply(ctx, config) {
 	/** 每个会话本轮要发出去的内容。 */
 	const pending = /* @__PURE__ */ new Map();
 	/** 已经绑定过流监听的会话。 */
-	const bound = /* @__PURE__ */ new Set();
-	/** 已经注册过 send_file 工具的会话（每个会话只注册一次）。 */
-	const media_bound = /* @__PURE__ */ new Set();
+	const bound = /* @__PURE__ */ new WeakSet();
+	let outbox;
 	/** 各会话最近一条消息 id（媒体被动回复要用）。 */
 	const last_msg = /* @__PURE__ */ new Map();
 	/** 已经装过记忆查询工具（timeline 系列 / relation_query）的 agent ctx。 */
-	const mem_tools_bound = /* @__PURE__ */ new WeakSet();
 	/** 助手回复的落档序号（按会话，保证 id 稳定不重）。 */
 	const asst_seq = /* @__PURE__ */ new Map();
 	/** 把一条 QQ 消息写进长期记忆时间线（写入由后台链路做，模型只有读工具）。 */
@@ -1386,45 +1609,26 @@ function apply(ctx, config) {
 	const register_query_tools = (ctx) => {
 		const suite = get_shared_memory();
 		if (suite === void 0) return;
-		const target = ctx;
-		if (mem_tools_bound.has(target)) return;
-		mem_tools_bound.add(target);
-		try {
-			register_timeline_tools(ctx, suite.timeline);
-			register_graph_tools(ctx, suite.graph);
-		} catch (error) {
-			probe("memory", "qq.register_tools_failed", { error: String(error) });
-		}
+		register_timeline_tools(ctx, suite.timeline);
+		register_graph_tools(ctx, suite.graph);
 	};
 	/** 一轮结束（或被取消）时把积累的正文发回 QQ。 */
 	const flush = async (session_id) => {
 		const item = pending.get(session_id);
-		pending.delete(session_id);
 		if (item === void 0 || item.text.trim() === "") return;
 		const seq = (asst_seq.get(session_id) ?? 0) + 1;
 		asst_seq.set(session_id, seq);
 		record_memory(session_id, "assistant", item.text.trim(), `qq-asst-${session_id}-${seq}`);
-		const result = await send_qq_text(tokens, item.target, item.text, item.msgId, config.base_url);
-		probe("outbound", "qq.send", {
-			session_id,
-			mode: result.mode,
-			ok: result.ok,
-			error: result.error ?? ""
-		});
-		if (!result.ok && result.mode === "passive") {
-			const active = await send_qq_text(tokens, item.target, item.text, void 0, config.base_url);
-			probe("outbound", "qq.send_fallback_active", {
-				session_id,
-				ok: active.ok,
-				error: active.error ?? ""
-			});
-		}
+		get_outbox().enqueue_reply(item);
+		pending.delete(session_id);
+		await get_outbox().drain_queue();
 	};
 	/** 首次见到某个 agent 时绑定流监听（每个 agent 只绑一次）。 */
 	const bind_stream = (agent, session_id) => {
-		if (bound.has(session_id)) return;
-		bound.add(session_id);
+		if (bound.has(agent)) return;
+		bound.add(agent);
 		agent.ctx.on("agent/assistant-stream", (payload) => {
+			if (payload.agent !== void 0 && payload.agent !== agent) return;
 			const frame = payload.frame;
 			if (frame?.type !== "chunk") return;
 			const chunk = frame.chunk;
@@ -1432,8 +1636,9 @@ function apply(ctx, config) {
 			const item = pending.get(session_id);
 			if (item !== void 0) item.text += chunk.text;
 		});
-		agent.ctx.on("agent/turn-stopping", () => {
-			flush(session_id);
+		agent.ctx.on("agent/turn-stopping", (payload) => {
+			if (payload.agent !== void 0 && payload.agent !== agent) return;
+			flush(session_id).catch((error) => probe("outbound", "qq.flush_failed", { error: String(error).slice(0, 160) }));
 		});
 	};
 	/**
@@ -1489,56 +1694,60 @@ function apply(ctx, config) {
 			register_query_tools(agent.ctx);
 			const session_key = String(session_id);
 			if (msg_id !== void 0) last_msg.set(session_key, msg_id);
-			if (!media_bound.has(session_key)) {
-				media_bound.add(session_key);
-				agent.ctx.tools.register(defineTool({
-					name: "send_file",
-					description: "把本地图片/视频/语音/文档真正发到当前 QQ 聊天（不是只给路径）。用户说\"发我\"\"发过来\"\"截图给我\"时用它。",
-					parameters: { path: {
-						type: "string",
-						description: "本地文件绝对路径（20MB 以内）"
-					} },
-					output: {
-						schema: {
-							type: "object",
-							additionalProperties: false,
-							properties: {
-								ok: {
-									type: "boolean",
-									required: true
-								},
-								text: {
-									type: "string",
-									required: true
-								}
+			const media_tool = defineTool({
+				name: "send_file",
+				description: "把本地图片/视频/语音/文档真正发到当前 QQ 聊天（不是只给路径）。用户说\"发我\"\"发过来\"\"截图给我\"时用它。",
+				parameters: { path: {
+					type: "string",
+					description: "本地文件绝对路径（20MB 以内）"
+				} },
+				output: {
+					schema: {
+						type: "object",
+						additionalProperties: false,
+						properties: {
+							ok: {
+								type: "boolean",
+								required: true
+							},
+							text: {
+								type: "string",
+								required: true
 							}
-						},
-						render: (_args, value) => [{
-							type: "text",
-							text: value.text
-						}]
+						}
 					},
-					async execute(args) {
-						const file = String(args.path ?? "").trim();
-						if (file === "") return {
-							ok: false,
-							text: "path 不能为空"
-						};
-						const result = await send_qq_media(tokens, target, file, last_msg.get(session_key), config.base_url);
-						if (result.ok) return {
-							ok: true,
-							text: `已发送：${file}（${result.mode}）`
-						};
-						return {
-							ok: false,
-							text: `发送失败：${result.error ?? "未知错误"}`
-						};
-					}
-				}));
+					render: (_args, value) => [{
+						type: "text",
+						text: value.text
+					}]
+				},
+				async execute(args) {
+					const file = String(args.path ?? "").trim();
+					if (file === "") return {
+						ok: false,
+						text: "path 不能为空"
+					};
+					const result = await send_qq_media(tokens, target, file, last_msg.get(session_key), config.base_url);
+					if (result.ok) return {
+						ok: true,
+						text: `已发送：${file}（${result.mode}）`
+					};
+					return {
+						ok: false,
+						text: `发送失败：${result.error ?? "未知错误"}`
+					};
+				}
+			});
+			const current = agent.ctx.tools.get("send_file", agent);
+			if (current === void 0) agent.ctx.tools.register(media_tool);
+			else {
+				current.description = media_tool.description;
+				current.parameters = media_tool.parameters;
+				current.execute = media_tool.execute;
 			}
 			bind_stream(agent, String(session_id));
 			pending.set(String(session_id), {
-				text: "",
+				text: pending.get(String(session_id))?.text ?? "",
 				...msg_id === void 0 ? {} : { msgId: msg_id },
 				target
 			});
@@ -1565,6 +1774,19 @@ function apply(ctx, config) {
 			await send_qq_text(tokens, target, "我这边刚才没处理成，稍后再试一次好吗？", msg_id, config.base_url);
 		}
 	};
+	/** 无参数；仅当前网关的实际发送链按需打开本地队列。 */
+	const get_outbox = () => {
+		outbox ??= new QqOutbox(process.env.DSH_QQ_OUTBOX ?? join(process.env.DSH_HOME ?? join(homedir(), ".dsh"), "qq-outbox.json"), async (row, mark) => {
+			const progress = {
+				sent_parts: row.sent_parts,
+				on_sent: mark
+			};
+			const result = await send_qq_text(tokens, row.target, row.text, row.msgId, config.base_url, progress);
+			if (!result.ok && result.mode === "passive" && /HTTP 400|HTTP 403/.test(result.error ?? "")) return send_qq_text(tokens, row.target, row.text, void 0, config.base_url, progress);
+			return result;
+		}, (state) => probe("outbound", "qq.send", state));
+		return outbox;
+	};
 	const gateway = new QqGateway({
 		token: () => tokens.get(),
 		...config.intents === void 0 ? {} : { intents: config.intents },
@@ -1572,12 +1794,16 @@ function apply(ctx, config) {
 		on_event: (event) => {
 			handle_event(event.t, event.d);
 		},
+		on_health: (state) => probe("lifecycle", "qq.health", {
+			...state,
+			pid: process.pid
+		}),
 		log: (message) => {
 			console.error(`[webhook-qq] ${message}`);
 			probe("lifecycle", "qq.gateway", { message: message.slice(0, 160) });
 		}
 	});
-	const lock_path = join(homedir(), ".dsh", "qq-gateway.pid");
+	const lock_path = join(process.env.DSH_HOME ?? join(homedir(), ".dsh"), "qq-gateway.pid");
 	const lock_held = (() => {
 		try {
 			const pid = Number(readFileSync(lock_path, "utf8").trim());
@@ -1598,11 +1824,36 @@ function apply(ctx, config) {
 			probe("lifecycle", "qq.gateway.skip_duplicate", { pid: process.pid });
 			return () => {};
 		}
-		writeFileSync(lock_path, String(process.pid), "utf8");
-		gateway.start();
-		probe("lifecycle", "qq.gateway.start", {});
+		const lease = new QqGatewayLease(join(process.env.DSH_HOME ?? join(homedir(), ".dsh"), "qq-gateway-lease.db"));
+		if (!lease.acquire_lease()) {
+			lease.release_lease();
+			probe("lifecycle", "qq.gateway.skip_duplicate", { pid: process.pid });
+			return () => {};
+		}
+		let retry;
+		try {
+			writeFileSync(lock_path, String(process.pid), "utf8");
+			get_outbox();
+			retry = setInterval(() => {
+				outbox?.drain_queue().catch((error) => probe("outbound", "qq.outbox_failed", { error: String(error).slice(0, 160) }));
+			}, 5e3);
+			get_outbox().drain_queue().catch((error) => probe("outbound", "qq.outbox_failed", { error: String(error).slice(0, 160) }));
+			gateway.start();
+			probe("lifecycle", "qq.gateway.start", {});
+		} catch (error) {
+			if (retry !== void 0) clearInterval(retry);
+			outbox?.stop_queue();
+			lease.release_lease();
+			try {
+				if (readFileSync(lock_path, "utf8").trim() === String(process.pid)) unlinkSync(lock_path);
+			} catch {}
+			throw error;
+		}
 		return () => {
 			gateway.stop();
+			if (retry !== void 0) clearInterval(retry);
+			outbox?.stop_queue();
+			lease.release_lease();
 			try {
 				if (readFileSync(lock_path, "utf8").trim() === String(process.pid)) unlinkSync(lock_path);
 			} catch {}

@@ -393,14 +393,17 @@ export class WeixinStateStore {
             probe('state', 'delivery.cas_miss', {
                 delivery_id, expected: fields.expect, actual: current.status,
             });
-            return;
+            return false;
         }
-        this.db.prepare('UPDATE delivery SET status = ?, session_id = COALESCE(?, session_id), injected_at = COALESCE(?, injected_at), '
-            + 'last_error = ?, attempt = attempt + ? WHERE delivery_id = ?').run(status, fields?.session_id ?? null, fields?.injected_at ?? null, fields?.last_error ?? null, fields?.increment_attempt === true ? 1 : 0, delivery_id);
+        const result = this.db.prepare('UPDATE delivery SET status = ?, session_id = COALESCE(?, session_id), injected_at = COALESCE(?, injected_at), '
+            + 'last_error = ?, attempt = attempt + ? WHERE delivery_id = ? AND status = ?').run(status, fields?.session_id ?? null, fields?.injected_at ?? null, fields?.last_error ?? null, fields?.increment_attempt === true ? 1 : 0, delivery_id, fields?.expect ?? current.status);
+        if (result.changes === 0)
+            return false;
         probe('state', 'delivery.status', {
             delivery_id, from: current.status, to: status,
             attempt: current.attempt + (fields?.increment_attempt === true ? 1 : 0),
         });
+        return true;
     }
     /** 列出未完成（需要恢复）的 delivery。 */
     list_unfinished_deliveries(limit = 200) {
@@ -602,8 +605,8 @@ export class WeixinStateStore {
                 // 注意：只看 "pid 存活 + 心跳新" 是不够的 —— Windows 会回收 pid，
                 // 被回收的 pid 会让陈旧 lease 看起来还活着（实测踩过：连接器一直拒绝启动）。所以这里校验启动时刻。
                 const alive = lease_holder_alive(existing.pid, existing.process_started_at);
-                const fresh = now - existing.heartbeat_at < input.stale_ms;
-                if (alive && fresh) {
+                // 活进程即使错过心跳也不能被第二个消费者抢占；先由守护停止旧进程。
+                if (alive) {
                     probe('state', 'lease.busy', { held_by: existing.owner_id, pid: existing.pid, age_ms: now - existing.heartbeat_at });
                     return false;
                 }
@@ -714,7 +717,7 @@ function process_started_at(pid) {
  * 判断 lease 里的持有者是否**真的还在**：pid 存活 **且** 启动时刻对得上。
  * 启动时刻拿不到时（权限/平台差异）退回"仅 pid 存活"，保持原有行为。
  */
-function lease_holder_alive(pid, recorded_started_at) {
+export function lease_holder_alive(pid, recorded_started_at) {
     if (!is_pid_alive(pid))
         return false;
     const actual = process_started_at(pid);

@@ -6,8 +6,7 @@
   出站 failed_terminal）以及语义失败（preset 挂不上），命中就走一遍恢复流程；
 - `recover`：调 `recoverLinks.linkRecovery`（L0 重启 → L1 清死锁 → L2 清状态库，
   preset 仍挂不上再升 L3 清上下文）；
-- `repair`：**重启治不好的故障**（代码/配置错）交给编码 agent（codex 优先、opencode 兜底），
-  只改白名单目录、改完静态验证、不通过就回滚；
+- `repair`：重启治不好的故障交给固定 `runCodeRepair.py`，不依赖 Harness Agent；
 - `notify`：恢复后用 QQ 推送一句"请重发"，推得通说明链路真回来了；
 - `halt`：连续两次恢复都推不通，就停掉整套栈并写「暂停自启」标记，
   不再让巡检反复拉起来空转（那只会无限刷日志、白耗电）。
@@ -26,7 +25,6 @@ import json
 import sqlite3
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -46,9 +44,8 @@ class linkSupervisor:
         self.cooldown = cooldown
         self.max_attempts = max_attempts
         self.state = self._load()
-        # 自修在后台线程里跑：codex 快的时候 1 分钟，慢的时候十几分钟，
-        # 同步跑会把巡检占住，那段时间心跳和 Gemma 检查全停 —— 等于修故障时监控失明。
-        self._repair = {"thread": None, "result": None}
+        # 自修由独立固定脚本进程执行，避免 Harness Agent 未启动时无法修复。
+        self._repair = {"process": None, "result": None, "request": None}
 
     # ---------------------------------------------------------------- 状态
 
@@ -61,6 +58,7 @@ class linkSupervisor:
             "last_heartbeat_at": 0.0, # 上次心跳（30 分钟一条，证明状态机活着）
             "last_health": None,      # 上次心跳时的健康结论（True/False），用于状态翻转时立刻记一条
             "seen_failures": [],      # 已经处理过的失败 id（只留最近 200 个）
+            "pending_failures": [],   # 冷却期间仍须保留的待恢复故障
         }
         try:
             if self.state_file.is_file():
@@ -171,37 +169,71 @@ class linkSupervisor:
             return False
 
     def start_repair(self, reason: str) -> bool:
-        """把自修丢到后台线程，巡检立刻返回。返回是否真的启动了。
+        """由固定脚本进程启动自修，巡检立刻返回。返回是否真的启动了。
 
         参数 reason：故障描述。
         """
-        thread = self._repair.get("thread")
-        if thread is not None and thread.is_alive():
+        process = self._repair.get("process")
+        if process is not None and process.poll() is None:
             self.log("上一轮自修还在跑，不重复启动")
             return False
         self._repair["result"] = None
-
-        def worker():
-            """后台跑自修，结果统一成 dict 放回 self._repair 供下一轮巡检取。"""
-            ok = self.repair(reason)
-            self._repair["result"] = {"ok": bool(ok),
-                                      "verify": "自修流程完成" if ok else "自修没修好"}
-
-        thread = threading.Thread(target=worker, name="codeRepair", daemon=True)
-        self._repair["thread"] = thread
-        thread.start()
-        self.log(f"自修已在后台启动（codex 最长 30 分钟，失败换 opencode）：{reason[:80]}")
+        self.runtime.mkdir(parents=True, exist_ok=True)
+        request = self.runtime / "coderepair-request.json"
+        result = self.runtime / "coderepair-result.json"
+        try:
+            sys.path.insert(0, str(self.root / "tools"))
+            from LogRedactor import LogRedactor  # noqa: PLC0415
+            safe_reason = LogRedactor.redact_text(reason)
+        except Exception:
+            safe_reason = "脱敏失败，已隐藏故障详情"
+        try:
+            evidence = self._evidence()[:4000]
+            request.write_text(json.dumps({
+                "reason": safe_reason[:1500], "detail": evidence,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            result.unlink(missing_ok=True)
+        except OSError as error:
+            self.log(f"固定自修请求落盘失败：{error}")
+            return False
+        script = self.root / "tools" / "runCodeRepair.py"
+        try:
+            flags = 0x08000000 if sys.platform == "win32" else 0
+            process = subprocess.Popen(
+                [sys.executable, str(script), "--root", str(self.root),
+                 "--request", str(request), "--result", str(result)],
+                cwd=str(self.root), stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=flags,
+            )
+        except OSError as error:
+            self.log(f"固定自修脚本启动失败：{error}")
+            return False
+        self._repair["process"] = process
+        self._repair["request"] = request
+        self.log(f"固定自修脚本已启动（PID {process.pid}，Codex 最长 30 分钟）：{safe_reason[:80]}")
         return True
 
     def _poll_repair(self) -> dict | None:
-        """自修线程跑完了就取出结果并清空，否则返回 None。"""
-        thread = self._repair.get("thread")
-        if thread is None:
+        """固定自修进程退出后读取结果；进程仍在运行返回 None。"""
+        process = self._repair.get("process")
+        if process is None:
             return None
-        if thread.is_alive():
+        if process.poll() is None:
             return None
-        result = self._repair.get("result") or {"ok": False, "verify": "自修线程没有返回结果"}
-        self._repair["thread"] = None
+        result_path = self.runtime / "coderepair-result.json"
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            result = {"ok": False, "verify": f"固定自修脚本无结果（退出码 {process.returncode}）"}
+        request = self._repair.get("request")
+        if isinstance(request, Path):
+            try:
+                request.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._repair["process"] = None
+        self._repair["request"] = None
         self._repair["result"] = None
         return result
 
@@ -215,8 +247,10 @@ class linkSupervisor:
 
         if result.get("ok"):
             self.log("自修完成，重跑一遍恢复看是否真的好了")
-            if self.recover() and self.notify("我这边自己修好了，链路已经通了，请把你刚才那条消息重发一下。"):
+            if self.recover():
+                self.notify("我这边自己修好了，后台已恢复，请把你刚才那条消息重发一下。")
                 self.state["attempts"] = 0
+                self.state["pending_failures"] = []
                 self.state["phase"] = "recovered"
                 self._save()
                 self.log("恢复成功且推送验证通过，已提醒主人重发")
@@ -254,7 +288,8 @@ class linkSupervisor:
                                    "failed to mount", "skills", "preset"))]
             tail = interesting[-keep:] or lines[-keep:]
             chunks.append(f"### {name}（尾部）\n" + "\n".join(line[:300] for line in tail))
-        return "\n\n".join(chunks)[:4000]
+        from LogRedactor import LogRedactor
+        return LogRedactor.redact_text("\n\n".join(chunks))[:4000]
 
 
     def notify(self, text: str) -> bool:
@@ -347,8 +382,8 @@ class linkSupervisor:
             return self._handle_repair(done)
 
         # 自修还在跑：别启动第二次恢复（会互相打架），但心跳照写
-        thread = self._repair.get("thread")
-        if thread is not None and thread.is_alive():
+        process = self._repair.get("process")
+        if process is not None and process.poll() is None:
             self._heartbeat(health)
             return self.state["phase"]
 
@@ -363,13 +398,21 @@ class linkSupervisor:
                     "reason": f"preset 挂载失败（欣爱起不来）：{str(health.get('preset_detail') or '')[:140]}",
                 })
 
+        pending = {item["key"]: item for item in self.state.get("pending_failures", [])}
+        pending.update({item["key"]: item for item in failures})
+        failures = list(pending.values())[-200:]
+        if not failures and self.state["phase"] == "retrying":
+            failures = [{"key": "retry:unresolved", "kind": "恢复", "reason": "上一轮恢复仍未完成"}]
+        self.state["pending_failures"] = failures
         if not failures:
             self._heartbeat(health)
             return self.state["phase"]
 
+        seen = set(self.state["seen_failures"])
         for item in failures:
-            self.state["seen_failures"].append(item["key"])
-            self.log(f"发现{item['kind']}失败：{item['reason'][:120]}")
+            if item["key"] not in seen:
+                self.state["seen_failures"].append(item["key"])
+                self.log(f"发现{item['kind']}失败：{item['reason'][:120]}")
         self._save()
 
         # 冷却：刚恢复过就别马上再来一次（否则会陷入重启风暴）
@@ -385,9 +428,7 @@ class linkSupervisor:
         self.log(f"第 {attempt} 次自动恢复（阈值 {self.max_attempts}）")
         recovered = self.recover()
 
-        # 重启和清状态都救不回来，说明是代码/配置坏了 —— 让编码 agent 动手。
-        # 它只改白名单目录、改完做静态验证、不通过就回滚，所以这里可以放心交给它。
-        # 放后台跑：codex 慢的时候要十几分钟，不能把巡检卡在这里。
+        # 恢复失败后异步提交故障单；不能把恢复失败直接断言为代码错误。
         if not recovered:
             reason = failures[0]["reason"] if failures else "链路恢复失败"
             if self.start_repair(reason):
@@ -400,16 +441,18 @@ class linkSupervisor:
         else:
             pushed = False
 
-        if recovered and pushed:
+        if recovered:
             self.state["attempts"] = 0
             self.state["phase"] = "recovered"
+            self.state["pending_failures"] = []
             self._save()
-            self.log("恢复成功且推送验证通过，已提醒主人重发")
+            self.log("恢复成功且推送验证通过，已提醒主人重发" if pushed
+                     else "后台恢复验证成功，通知未送达；保留运行，不因推送失败停机")
             return "recovered"
 
-        # 走到这里说明「修好了但推不出去」或「压根没修好」
+        # 只有后台恢复验证本身失败才累计停机阈值。
         if attempt >= self.max_attempts:
-            self.halt(f"连续 {attempt} 次自动恢复后仍然推送失败，已停止空转")
+            self.halt(f"连续 {attempt} 次后台恢复验证失败，已停止空转")
             return "halted"
 
         self.state["phase"] = "retrying"

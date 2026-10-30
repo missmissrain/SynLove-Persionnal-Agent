@@ -14,9 +14,9 @@
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
-import shutil
 import socket
 import sqlite3
 import subprocess
@@ -36,6 +36,7 @@ sys.path.insert(0, str(ROOT))
 
 from skills.store.durableFile import durableFile  # noqa: E402
 from skills.store.runLock import runLock  # noqa: E402
+from tools.PowerKeepAlive import PowerKeepAlive  # noqa: E402
 
 STATE_DB = Path.home() / ".dsh" / "weixin-state.db"
 QQ_LOCK = Path.home() / ".dsh" / "qq-gateway.pid"
@@ -68,6 +69,7 @@ _seen_inbound_failures: set[str] = set()   # 已告警过的入站失败（按 d
 STATE_DB = Path.home() / ".dsh" / "weixin-state.db"
 PAUSE_MARKER = ROOT / "runtime" / "guardian.pause"
 _SUPERVISOR = None                         # 自愈状态机（第一次用到时才建）
+_POWER = PowerKeepAlive()
 
 # 语义探针的最近结果：心跳要用它判断"链路到底能不能用"，
 # 而不是只看"有没有抓到新失败"（没人发消息时永远抓不到）。
@@ -111,7 +113,7 @@ def port_open(port):
 
 
 def release_deliveries(now_ms):
-    """把超时的非终态投递标记为终态，释放游标。"""
+    """now_ms 为当前毫秒；把未注入的陈旧投递交回有限重试，保留原错及合法终态。"""
     if not STATE_DB.is_file():
         return 0
     cutoff = now_ms - DELIVERY_STUCK_MINUTES * 60 * 1000
@@ -120,19 +122,19 @@ def release_deliveries(now_ms):
         try:
             rows = db.execute(
                 "select delivery_id, status from delivery "
-                "where status not in ('injected','failed_terminal') and received_at < ?",
+                "where status in ('received','routing') and received_at < ?",
                 (cutoff,),
             ).fetchall()
             if not rows:
                 return 0
             db.execute(
-                "update delivery set status='failed_terminal', "
-                "last_error='stuck before terminal (guard recover)' "
-                "where status not in ('injected','failed_terminal') and received_at < ?",
+                "update delivery set status='failed_retryable', "
+                "last_error=COALESCE(last_error,'stuck before injection (guard retry)') "
+                "where status in ('received','routing') and received_at < ?",
                 (cutoff,),
             )
             db.commit()
-            log("释放卡住投递 " + ", ".join(f"{row[0]}({row[1]})" for row in rows))
+            log("重试卡住投递 " + ", ".join(f"{row[0]}({row[1]})" for row in rows))
             return len(rows)
         finally:
             db.close()
@@ -193,7 +195,9 @@ def check_rsshub():
     """RSSHub（1200）没在跑就拉起来（日报依赖它）。"""
     if port_open(RSSHUB_PORT) or not RSSHUB_ENTRY.is_file():
         return
-    node = shutil.which("node") or "node"
+    node = r"E:\project_make\nodejs\node.exe"
+    if not Path(node).is_file():
+        node = "node"
     env = {**os.environ, "PORT": str(RSSHUB_PORT), "NODE_ENV": "production",
            "NODE_OPTIONS": "--max-http-header-size=32768"}
     try:
@@ -280,7 +284,7 @@ def check_weixin_stall():
 
 
 def check_qq_gateway():
-    """QQ 网关 pid 是否活着；挂了就拉起整套栈。"""
+    """无参数；核对 QQ 进程及有期限的协议心跳，不能把进程存活当连接正常。"""
     if not QQ_LOCK.is_file():
         return
     try:
@@ -288,6 +292,21 @@ def check_qq_gateway():
     except (OSError, ValueError):
         pid = 0
     if pid > 0 and process_alive(pid):
+        try:
+            rows = (ROOT / "runtime" / "weixin-probe.log").read_text(encoding="utf-8", errors="replace").splitlines()
+            for line in reversed(rows):
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    continue
+                data = item.get("data", {})
+                if item.get("event") != "qq.health" or data.get("pid") != pid:
+                    continue
+                if time.time() * 1000 > float(data.get("expires_at") or 0) + 60000:
+                    restart_stack("QQ 协议心跳已过期")
+                return
+        except (OSError, ValueError):
+            pass
         return
     restart_stack(f"QQ 网关进程不在（pid={pid}）")
 
@@ -300,8 +319,20 @@ def check_gemma_alive():
     """
     global _gemma_failures
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{GEMMA_PORT}/health", timeout=10) as response:
-            body = response.read().decode("utf-8", "replace")
+        from services.ServiceRegistry import ServiceRegistry
+        from services.ServiceClient import ServiceClient
+        from urllib.parse import urlsplit, urlunsplit
+        cfg = ServiceRegistry().get_service("llm")
+        if cfg["management"] == "external":
+            _gemma_failures = 0
+            return None  # 外部服务不归本机守护器管理，也不应显示假绿。
+        url = urlsplit(cfg["baseURL"])
+        cfg["baseURL"] = urlunsplit((url.scheme, url.netloc, "", "", ""))
+        cfg["timeoutSeconds"] = 10
+        body, _ = ServiceClient(cfg).request(cfg.get("healthPath", "/health"), limit=65536)
+        data = json.loads(body)
+        if data.get("ok") is not True and data.get("status") != "ok":
+            raise ValueError("模型服务健康检查失败")
     except Exception as error:  # noqa: BLE001
         _gemma_failures += 1
         log(f"Gemma 探活失败（第 {_gemma_failures} 次）：{error}")
@@ -309,7 +340,7 @@ def check_gemma_alive():
     if _gemma_failures > 0:
         log(f"Gemma 探活恢复（之前连续失败 {_gemma_failures} 次）")
     _gemma_failures = 0
-    return '"ok"' in body or '"status"' in body
+    return True
 
 
 def check_semantic_health():
@@ -331,7 +362,7 @@ def check_semantic_health():
     gemma_ok = check_gemma_alive()
     _health["gemma_ok"] = gemma_ok
     _health["gemma_at"] = time.time()
-    if not gemma_ok and _gemma_failures >= 2:
+    if gemma_ok is False and _gemma_failures >= 2:
         restart_stack(f"Gemma 连续 {_gemma_failures} 次探活失败")
 
 
@@ -366,7 +397,11 @@ def _preset_evidence():
             if event in ("agent.created", "agent.resumed"):
                 if ts > good_at:
                     good_at, good_what = ts, event
-            elif event in ("qq.handle_failed", "preset.reload_failed", "admin.failed"):
+            elif event == "preset.reload_failed" or (
+                event in ("qq.handle_failed", "admin.failed")
+                and any(word in str(record.get("error") or "").lower()
+                        for word in ("preset", "failed to mount", "failed to load"))
+            ):
                 if ts > bad_at:
                     bad_at, bad_what = ts, event
 
@@ -491,12 +526,12 @@ def check_inbound_failures():
     failed = 0
     for row in rows:
         delivery_id = str(row["delivery_id"])
-        if delivery_id in _seen_inbound_failures:
-            continue
-        _seen_inbound_failures.add(delivery_id)
         fresh += 1
         if str(row["status"]) != "failed_terminal":
             continue
+        if delivery_id in _seen_inbound_failures:
+            continue
+        _seen_inbound_failures.add(delivery_id)
         reason = str(row["last_error"] or "")
         if "用户已取消" in reason:
             continue
@@ -508,8 +543,7 @@ def check_inbound_failures():
     if len(_seen_inbound_failures) > 500:
         _seen_inbound_failures = set(list(_seen_inbound_failures)[-200:])
 
-    if fresh and not failed:
-        log(f"入站 {fresh} 条，全部已交给模型（无失败）")
+    # received/routing 不等于注入成功；不再打印误导性的“全部已交给模型”。
 
 
 def warn_owner(text):
@@ -518,6 +552,17 @@ def warn_owner(text):
     走 tools/qq_notify.py，失败只记日志——告警自己不能再抛异常。
     """
     try:
+        # 统一告警去重，覆盖“有入站零出站”分支；落盘后重启守护也不会每分钟刷屏。
+        state_file = ROOT / "runtime" / "guard-alert-state.json"
+        state = FILE_WRITER.read_json(state_file)
+        key = hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+        now = time.time()
+        if now - float(state.get(key) or 0) < 3600:
+            return
+        state = {name: stamp for name, stamp in state.items()
+                 if isinstance(stamp, (int, float)) and now - stamp < 86400}
+        state[key] = now
+        FILE_WRITER.write_text(state_file, json.dumps(state, ensure_ascii=False))
         sys.path.insert(0, str(ROOT / "tools"))
         from qq_notify import send_qq_text_message  # noqa: PLC0415 —— 惰性导入，避免启动时强依赖
         result = send_qq_text_message(f"【链路告警】{text}")
@@ -643,6 +688,14 @@ def check_self_healing():
 
 def guard_once():
     """跑一轮巡检。"""
+    # 所有守护动作共享维护暂停，不能只在 restart_stack 内检查。
+    paused = _halt_marker_active()
+    _POWER.set_active(not paused and port_open(HARNESS_PORT))
+    if paused:
+        return
+    process = _SUPERVISOR._repair.get("process") if _SUPERVISOR is not None else None
+    if process is not None and process.poll() is None:
+        return
     now_ms = int(time.time() * 1000)
     release_deliveries(now_ms)
     reset_outbox(now_ms)
@@ -671,12 +724,15 @@ def main(argv=None):
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
     log("兜底巡检启动：每 60 秒一次")
-    while True:
-        try:
-            guard_once()
-        except Exception as error:  # noqa: BLE001
-            log(f"巡检异常：{type(error).__name__}: {error}")
-        time.sleep(60)
+    try:
+        while True:
+            try:
+                guard_once()
+            except Exception as error:  # noqa: BLE001
+                log(f"巡检异常：{type(error).__name__}: {error}")
+            time.sleep(60)
+    finally:
+        _POWER.set_active(False)
 
 
 if __name__ == "__main__":

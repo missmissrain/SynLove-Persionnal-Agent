@@ -17,6 +17,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { KnowledgeGraphStore } from './graphStore.ts'
 import { GRAPH_ASSISTANT_NAME, type PersonNode } from './graphTypes.ts'
+import { MemoryToolRegistry } from './MemoryToolRegistry.ts'
 
 /** 单次返回给模型的最大字符数。 */
 const MAX_CHARS = 5_000
@@ -63,7 +64,8 @@ function relation_lines(graph: KnowledgeGraphStore, id: string): string[] {
  * @param graph - 知识图谱存储。
  */
 export function register_graph_tools(agent_ctx: Context, graph: KnowledgeGraphStore): void {
-  agent_ctx.tools.register(defineTool({
+  MemoryToolRegistry.register_tools(agent_ctx, 'graph', register => {
+  register(defineTool({
     name: 'relation_query',
     description: [
       '查询家人/朋友关系（知识图谱）。这张图**以「欣爱」（你自己）为中心**：',
@@ -173,4 +175,5 @@ export function register_graph_tools(agent_ctx: Context, graph: KnowledgeGraphSt
       return { ok: true, text: clip(lines.join('\n')) }
     },
   }))
+  })
 }

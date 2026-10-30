@@ -22,6 +22,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { TimelineStore } from './timelineStore.ts'
+import { MemoryToolRegistry } from './MemoryToolRegistry.ts'
 
 /** 单次返回给模型的最大字符数，避免一次把上下文顶爆。 */
 const MAX_CHARS = 6_000
@@ -45,7 +46,8 @@ function as_date(value: unknown): string | undefined {
  * @param store - 时间线存储。
  */
 export function register_timeline_tools(agent_ctx: Context, store: TimelineStore): void {
-  agent_ctx.tools.register(defineTool({
+  MemoryToolRegistry.register_tools(agent_ctx, 'timeline', register => {
+  register(defineTool({
     name: 'timeline_days',
     description: [
       '查看"长期记忆里有哪些天"，以及每天的对话条数和当天摘要。这是最便宜的一层。',
@@ -105,7 +107,7 @@ export function register_timeline_tools(agent_ctx: Context, store: TimelineStore
     },
   }))
 
-  agent_ctx.tools.register(defineTool({
+  register(defineTool({
     name: 'timeline_search',
     description: [
       '在长期记忆里按关键词搜索，返回**命中的日期 + 谁说的 + 片段**。中间层。',
@@ -162,7 +164,7 @@ export function register_timeline_tools(agent_ctx: Context, store: TimelineStore
     },
   }))
 
-  agent_ctx.tools.register(defineTool({
+  register(defineTool({
     name: 'timeline_read',
     description: [
       '读某一天（或一段日期）的长期记忆：**当天的摘要 + 逐句原文**。最贵的一层，请最后用。',
@@ -225,4 +227,5 @@ export function register_timeline_tools(agent_ctx: Context, store: TimelineStore
       return { ok: true, text: clip(blocks.join('\n\n')) }
     },
   }))
+  })
 }

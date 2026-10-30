@@ -14,6 +14,7 @@
  */
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { GRAPH_ASSISTANT_NAME } from "./graphTypes.js";
+import { MemoryToolRegistry } from "./MemoryToolRegistry.js";
 /** 单次返回给模型的最大字符数。 */
 const MAX_CHARS = 5_000;
 function clip(text) {
@@ -64,113 +65,115 @@ function relation_lines(graph, id) {
  * @param graph - 知识图谱存储。
  */
 export function register_graph_tools(agent_ctx, graph) {
-    agent_ctx.tools.register(defineTool({
-        name: 'relation_query',
-        description: [
-            '查询家人/朋友关系（知识图谱）。这张图**以「欣爱」（你自己）为中心**：',
-            '不填 from 就默认从欣爱出发，所以"主人和 XX 是什么关系"直接给 to 即可。',
-            '图谱里的两个固定节点：`欣爱`（你）与 `主人`（用户本人，真名可能在他的别名里）。',
-            '',
-            '两种用法：',
-            '- 只给 to：查"欣爱 → to"的链路，也就是这个人和这个家是什么关系；',
-            '- 只给 from：查这个人的资料 + 他身边都有谁（向外 2 层）；',
-            '- 同时给 from 和 to：查两人的关系链路，**会自动递归多跳**，',
-            '  例如"小红是小明的朋友，小红的朋友是老王"。',
-            '',
-            '什么时候该用：',
-            '- 用户问"XX 是谁/XX 的电话/XX 在哪/XX 是我什么人"（"我"就是 `主人`）；',
-            '- 用户提到一个你不认识的人名，需要先查一下再回答；',
-            '- 需要理清"谁的谁"这种链路（亲戚、朋友的朋友）。',
-            '',
-            '什么时候不该用：',
-            '- 当前对话里已经说清楚的信息，不要为了确认再查；',
-            '- 用户只是闲聊、不涉及具体人物时不要调用。',
-            '',
-            '返回的是图谱里**已记录**的内容；如果没这个人或没有通路，会如实告诉你，',
-            '不要据此编造关系或属性。',
-        ].join('\n'),
-        parameters: {
-            from: { type: 'string', description: '起点人物姓名（或已知别名）；不填默认「欣爱」。' },
-            to: { type: 'string', description: '终点人物姓名；给了就查两人之间的关系链路。' },
-            max_depth: { type: 'number', description: '链路最多几跳，默认 4。' },
-        },
-        output: {
-            schema: {
-                type: 'object',
-                additionalProperties: false,
-                properties: {
-                    ok: { type: 'boolean', required: true },
-                    text: { type: 'string', required: true },
-                },
+    MemoryToolRegistry.register_tools(agent_ctx, 'graph', register => {
+        register(defineTool({
+            name: 'relation_query',
+            description: [
+                '查询家人/朋友关系（知识图谱）。这张图**以「欣爱」（你自己）为中心**：',
+                '不填 from 就默认从欣爱出发，所以"主人和 XX 是什么关系"直接给 to 即可。',
+                '图谱里的两个固定节点：`欣爱`（你）与 `主人`（用户本人，真名可能在他的别名里）。',
+                '',
+                '两种用法：',
+                '- 只给 to：查"欣爱 → to"的链路，也就是这个人和这个家是什么关系；',
+                '- 只给 from：查这个人的资料 + 他身边都有谁（向外 2 层）；',
+                '- 同时给 from 和 to：查两人的关系链路，**会自动递归多跳**，',
+                '  例如"小红是小明的朋友，小红的朋友是老王"。',
+                '',
+                '什么时候该用：',
+                '- 用户问"XX 是谁/XX 的电话/XX 在哪/XX 是我什么人"（"我"就是 `主人`）；',
+                '- 用户提到一个你不认识的人名，需要先查一下再回答；',
+                '- 需要理清"谁的谁"这种链路（亲戚、朋友的朋友）。',
+                '',
+                '什么时候不该用：',
+                '- 当前对话里已经说清楚的信息，不要为了确认再查；',
+                '- 用户只是闲聊、不涉及具体人物时不要调用。',
+                '',
+                '返回的是图谱里**已记录**的内容；如果没这个人或没有通路，会如实告诉你，',
+                '不要据此编造关系或属性。',
+            ].join('\n'),
+            parameters: {
+                from: { type: 'string', description: '起点人物姓名（或已知别名）；不填默认「欣爱」。' },
+                to: { type: 'string', description: '终点人物姓名；给了就查两人之间的关系链路。' },
+                max_depth: { type: 'number', description: '链路最多几跳，默认 4。' },
             },
-            render: (_args, value) => [{ type: 'text', text: String(value.text ?? '') }],
-        },
-        async execute(args) {
-            // 不填 from 就从中心（欣爱）出发：这才是"这张图以欣爱为中心"的实际含义，
-            // 也让模型问"主人和 XX 什么关系"时少填一个参数、少错一次。
-            const from = typeof args.from === 'string' ? args.from.trim() : '';
-            const to = typeof args.to === 'string' ? args.to.trim() : '';
-            if (from === '' && to === '') {
-                return { ok: false, text: '至少要给 from 或 to 一个人名。' };
-            }
-            const origin = from === '' ? GRAPH_ASSISTANT_NAME : from;
-            const start = graph.find(origin);
-            if (start === undefined) {
-                const known = graph.nodes().map(node => node.name).slice(0, 30);
-                return {
-                    ok: true,
-                    text: known.length === 0
-                        ? '知识图谱里还没有任何人物记录。'
-                        : `没有找到"${origin}"。目前记录在册的人有：${known.join('、')}。请确认名字，或如实告诉用户你还不认识这个人。`,
-                };
-            }
-            const max_depth = Number(args.max_depth) || 4;
-            // 只给 from：资料 + 关系网
-            if (to === '') {
-                const attributes = graph.attributes(start.name);
-                const ring = graph.neighborhood(start.name, { max_depth: 2 });
-                const lines = [
-                    `【${start.name}】${describe_person(attributes ?? start)}`,
-                ];
-                if (ring.length > 0) {
-                    lines.push('');
-                    lines.push('关系网（他/她怎么称呼别人）：');
-                    for (const item of ring) {
-                        lines.push(`- ${item.label}：${item.name}${item.depth > 1 ? `（${item.depth} 层关系）` : ''}`);
-                    }
+            output: {
+                schema: {
+                    type: 'object',
+                    additionalProperties: false,
+                    properties: {
+                        ok: { type: 'boolean', required: true },
+                        text: { type: 'string', required: true },
+                    },
+                },
+                render: (_args, value) => [{ type: 'text', text: String(value.text ?? '') }],
+            },
+            async execute(args) {
+                // 不填 from 就从中心（欣爱）出发：这才是"这张图以欣爱为中心"的实际含义，
+                // 也让模型问"主人和 XX 什么关系"时少填一个参数、少错一次。
+                const from = typeof args.from === 'string' ? args.from.trim() : '';
+                const to = typeof args.to === 'string' ? args.to.trim() : '';
+                if (from === '' && to === '') {
+                    return { ok: false, text: '至少要给 from 或 to 一个人名。' };
                 }
-                else {
-                    lines.push('', '（图谱里还没有这个人的关系记录）');
+                const origin = from === '' ? GRAPH_ASSISTANT_NAME : from;
+                const start = graph.find(origin);
+                if (start === undefined) {
+                    const known = graph.nodes().map(node => node.name).slice(0, 30);
+                    return {
+                        ok: true,
+                        text: known.length === 0
+                            ? '知识图谱里还没有任何人物记录。'
+                            : `没有找到"${origin}"。目前记录在册的人有：${known.join('、')}。请确认名字，或如实告诉用户你还不认识这个人。`,
+                    };
+                }
+                const max_depth = Number(args.max_depth) || 4;
+                // 只给 from：资料 + 关系网
+                if (to === '') {
+                    const attributes = graph.attributes(start.name);
+                    const ring = graph.neighborhood(start.name, { max_depth: 2 });
+                    const lines = [
+                        `【${start.name}】${describe_person(attributes ?? start)}`,
+                    ];
+                    if (ring.length > 0) {
+                        lines.push('');
+                        lines.push('关系网（他/她怎么称呼别人）：');
+                        for (const item of ring) {
+                            lines.push(`- ${item.label}：${item.name}${item.depth > 1 ? `（${item.depth} 层关系）` : ''}`);
+                        }
+                    }
+                    else {
+                        lines.push('', '（图谱里还没有这个人的关系记录）');
+                    }
+                    return { ok: true, text: clip(lines.join('\n')) };
+                }
+                // 给了 to：查链路
+                const end = graph.find(to);
+                if (end === undefined) {
+                    const known = graph.nodes().map(node => node.name).slice(0, 30);
+                    return { ok: true, text: `没有找到"${to}"。目前记录在册的人有：${known.join('、')}。` };
+                }
+                const paths = graph.paths(start.name, end.name, { max_depth });
+                if (paths.length === 0) {
+                    return {
+                        ok: true,
+                        text: `图谱里没有从"${start.name}"到"${end.name}"的关系链路（最多找了 ${max_depth} 跳）。`
+                            + '不要据此编造关系；如果用户说了他们的关系，可以在回复里请用户确认。',
+                    };
+                }
+                const lines = [
+                    `【${start.name}】${describe_person(graph.attributes(start.name) ?? start)}`,
+                    ...relation_lines(graph, start.id),
+                    `【${end.name}】${describe_person(graph.attributes(end.name) ?? end)}`,
+                    ...relation_lines(graph, end.id),
+                    '',
+                    `找到 ${paths.length} 条关系链路：`,
+                ];
+                for (const path of paths.slice(0, 5)) {
+                    lines.push(`- ${path.readable}（${path.hops.length} 跳）`);
                 }
                 return { ok: true, text: clip(lines.join('\n')) };
-            }
-            // 给了 to：查链路
-            const end = graph.find(to);
-            if (end === undefined) {
-                const known = graph.nodes().map(node => node.name).slice(0, 30);
-                return { ok: true, text: `没有找到"${to}"。目前记录在册的人有：${known.join('、')}。` };
-            }
-            const paths = graph.paths(start.name, end.name, { max_depth });
-            if (paths.length === 0) {
-                return {
-                    ok: true,
-                    text: `图谱里没有从"${start.name}"到"${end.name}"的关系链路（最多找了 ${max_depth} 跳）。`
-                        + '不要据此编造关系；如果用户说了他们的关系，可以在回复里请用户确认。',
-                };
-            }
-            const lines = [
-                `【${start.name}】${describe_person(graph.attributes(start.name) ?? start)}`,
-                ...relation_lines(graph, start.id),
-                `【${end.name}】${describe_person(graph.attributes(end.name) ?? end)}`,
-                ...relation_lines(graph, end.id),
-                '',
-                `找到 ${paths.length} 条关系链路：`,
-            ];
-            for (const path of paths.slice(0, 5)) {
-                lines.push(`- ${path.readable}（${path.hops.length} 跳）`);
-            }
-            return { ok: true, text: clip(lines.join('\n')) };
-        },
-    }));
+            },
+        }));
+    });
 }
 //# sourceMappingURL=graphTools.js.map

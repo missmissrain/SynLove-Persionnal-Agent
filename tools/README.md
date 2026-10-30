@@ -17,38 +17,17 @@
 | `check_state.py` | 只读查看：发送队列、投递、租约、时间线/图谱规模 |
 | `trace_pipeline.py` | 追踪一条消息的完整链路（哪一步卡住一眼可见） |
 | `reset_weixin_state.py` | 清调试数据（**默认不动长期记忆**，要清加 `--purge-memory`） |
+| `bench_memory.py` | 时间线写入性能基准（防写入变慢拖住主链路） |
+| `make_backup.py` | 参数化版本备份（替代历史上散落的一串 `make_backup_vNN.py`） |
 | `autostart.py` | **开机自启入口**：等网络/代理就绪后拉起 harness（见下） |
 | `autostart-hidden.ps1` | 自启的"带环境变量"包装：设 `PYTHONUTF8=1` 后隐藏拉起 `autostart.py` |
 | `install-autostart.ps1` | 注册/注销/查看自启快捷方式（`-Remove` / `-Status`） |
 | `guardService.py` | 链路巡检总入口：进程/端口、微信静默、入站失败、出站被拒、语义健康，外加自愈委托 |
 | `linkSupervisor.py` | 自愈状态机：失败 → 恢复 → 推送验证 → 连续 2 次失败停机（状态落 `runtime/link-supervisor.json`） |
-| `recoverLinks.py` / `.cmd` | 一键恢复 L0→L2（必要时升 L3 清上下文），恢复完用 `reload-preset` 验证 |
-| `codeRepair.py` / `.cmd` | **自修**：重启治不好的代码/配置故障，交给 codex（主）/ opencode（备）改，改完静态验证，不通过就回滚 |
+| `recoverLinks.py` | 一键恢复 L0→L2（必要时升 L3 清上下文），恢复完用 `reload-preset` 验证 |
+| `runCodeRepair.py` | **固定自修入口**：脱离 Harness Agent，直接启动 `codeRepair.py`，写入结果文件 |
+| `codeRepair.py` | **自修执行器**：由固定脚本调用 codex（主）/ opencode（备），改前快照，改后静态验证，不通过就回滚 |
 | `inboundAudit.py` | 入站审计：按小时看消息到达/断链窗口，区分正常保活与异常断开 |
-| `runHidden.vbs` | 计划任务用的静默启动壳：`wscript` 起 `cmd` 但窗口完全隐藏，避免每 5 分钟闪一次黑框 |
-
-## 为什么屏幕上老是闪 cmd（2026-10-30 修）
-
-症状：桌面隔一会儿闪一个黑色 cmd 窗口，找不到是谁。
-
-查出三个来源，共同点是**都会周期性地起控制台程序，却没人给它们隐藏窗口**：
-
-| 来源 | 频率 | 原因 |
-|---|---|---|
-| `SynLoveGuard` 计划任务 | 每 5 分钟 | 任务动作直接指向 `guardOnce.cmd`，计划任务用交互令牌启动 → 每跑一次弹一个 cmd |
-| `SynLoveConsoleWatch` 计划任务 | 每 5 分钟 | 同上，指向 `consoleWatch.cmd` |
-| `guardService.py` 的 `process_alive()` | 巡检每轮 | 用 `subprocess.run(["tasklist", ...])` 判活，**没带 `CREATE_NO_WINDOW`**；巡检自己无控制台，于是每次调用都新建一个窗口 |
-
-修法两处：
-
-1. 代码里凡是起 console 程序一律带 `creationflags=CREATE_NO_WINDOW`
-   （`guardService.py`、`recoverLinks.py`、`consoleWatch.py`）。
-2. 计划任务的动作改成 `wscript.exe //B "tools\runHidden.vbs" "tools\xxx.cmd"`。
-   `wscript` 是 GUI 子系统程序、不建控制台，再由它用 `WshShell.Run(..., 0, ...)` 把子进程窗口设为隐藏。
-
-判断同类问题的通用办法：拿 `tasklist /v` 看 `cmd.exe` 的"窗口标题"列，
-隐藏的窗口是 `N/A`；或者用 `Get-CimInstance Win32_Process` 定时采样 pid，
-每 5 分钟出现又消失的新 pid 就是元凶。
 
 ## 后端守护（心跳）与"停不干净"的坑
 

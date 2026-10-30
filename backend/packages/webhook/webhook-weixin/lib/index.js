@@ -869,15 +869,16 @@ var WeixinStateStore = class {
 				expected: fields.expect,
 				actual: current.status
 			});
-			return;
+			return false;
 		}
-		this.db.prepare("UPDATE delivery SET status = ?, session_id = COALESCE(?, session_id), injected_at = COALESCE(?, injected_at), last_error = ?, attempt = attempt + ? WHERE delivery_id = ?").run(status, fields?.session_id ?? null, fields?.injected_at ?? null, fields?.last_error ?? null, fields?.increment_attempt === true ? 1 : 0, delivery_id);
+		if (this.db.prepare("UPDATE delivery SET status = ?, session_id = COALESCE(?, session_id), injected_at = COALESCE(?, injected_at), last_error = ?, attempt = attempt + ? WHERE delivery_id = ? AND status = ?").run(status, fields?.session_id ?? null, fields?.injected_at ?? null, fields?.last_error ?? null, fields?.increment_attempt === true ? 1 : 0, delivery_id, fields?.expect ?? current.status).changes === 0) return false;
 		probe("state", "delivery.status", {
 			delivery_id,
 			from: current.status,
 			to: status,
 			attempt: current.attempt + (fields?.increment_attempt === true ? 1 : 0)
 		});
+		return true;
 	}
 	/** 列出未完成（需要恢复）的 delivery。 */
 	list_unfinished_deliveries(limit = 200) {
@@ -1071,8 +1072,7 @@ var WeixinStateStore = class {
 			const existing = this.get_lease();
 			if (existing !== void 0) {
 				const alive = lease_holder_alive(existing.pid, existing.process_started_at);
-				const fresh = now - existing.heartbeat_at < input.stale_ms;
-				if (alive && fresh) {
+				if (alive) {
 					probe("state", "lease.busy", {
 						held_by: existing.owner_id,
 						pid: existing.pid,
@@ -1714,10 +1714,9 @@ function parse_control_command(text) {
 /** 微信入站协调器。 */
 var InboundCoordinator = class {
 	options;
+	disposed = false;
 	shards = /* @__PURE__ */ new Map();
 	pending_media = /* @__PURE__ */ new Map();
-	/** 已注册 send_file 的会话 */
-	media_bound = /* @__PURE__ */ new Set();
 	/** 各用户最近一次 context_token（媒体被动回复要用） */
 	latest_token = /* @__PURE__ */ new Map();
 	/**
@@ -1766,6 +1765,7 @@ var InboundCoordinator = class {
 				payload_json: serialize_payload(message)
 			})) {
 				probe("inbound", "batch.skip_duplicate", { delivery_id: message.delivery_id });
+				if (this.options.store.get_delivery(message.delivery_id)?.status === "failed_retryable") tasks.push(this.enqueue_for_user(message));
 				continue;
 			}
 			this.options.record_entry?.({
@@ -1796,7 +1796,8 @@ var InboundCoordinator = class {
 		return committable;
 	}
 	/** 把一条消息排进其所属用户的分片链；同用户严格保序，不同用户并发。 */
-	enqueue_for_user(message) {
+	enqueue_for_user(message, run) {
+		if (this.disposed) return Promise.resolve();
 		const previous = this.shards.get(message.user_id) ?? {
 			chain: Promise.resolve(),
 			depth: 0
@@ -1829,7 +1830,7 @@ var InboundCoordinator = class {
 			depth: shard.depth
 		});
 		const task = shard.chain.then(async () => {
-			await this.process_message(message);
+			await (run === void 0 ? this.process_message(message) : run());
 		});
 		shard.chain = task.catch((error) => {
 			probe("inbound", "shard.task_failed", {
@@ -1839,7 +1840,7 @@ var InboundCoordinator = class {
 			});
 		}).finally(() => {
 			const current = this.shards.get(message.user_id);
-			if (current !== void 0 && current.chain === shard.chain) {
+			if (current !== void 0) {
 				current.depth = Math.max(0, current.depth - 1);
 				if (current.depth === 0) this.shards.delete(message.user_id);
 			}
@@ -1886,38 +1887,44 @@ var InboundCoordinator = class {
 			}
 			await this.coalesce_message(message);
 		} catch (error) {
-			const detail = error instanceof Error ? error.message : String(error);
-			const attempt = (this.options.store.get_delivery(message.delivery_id)?.attempt ?? 0) + 1;
-			if (attempt >= MAX_DELIVERY_ATTEMPTS) {
-				this.options.store.update_delivery(message.delivery_id, "failed_terminal", {
-					last_error: detail,
-					increment_attempt: true
-				});
-				probe("inbound", "message.failed_terminal", {
-					delivery_id: message.delivery_id,
-					attempt,
-					error: detail
-				});
-				this.options.enqueue_outbound({
-					session_id: this.options.store.get_session_id(message.user_id) ?? `weixin-${message.user_id}`,
-					user_id: message.user_id,
-					kind: "error",
-					text: "（这条消息处理失败了，我已经记录下来；请稍后再发一次或告诉我换种说法）",
-					...message.context_token === void 0 ? {} : { context_token: message.context_token }
-				});
-				return;
-			}
-			this.options.store.update_delivery(message.delivery_id, "failed_retryable", {
+			this.handle_message_failure(message, error);
+		}
+	}
+	/** message 为原始投递，error 为处理异常；统一计次、记录原错并在达到上限时发送失败回执。 */
+	handle_message_failure(message, error) {
+		if (this.disposed) return;
+		const current = this.options.store.get_delivery(message.delivery_id);
+		if (current !== void 0 && is_cursor_committable(current.status)) return;
+		const detail = error instanceof Error ? error.message : String(error);
+		const attempt = (this.options.store.get_delivery(message.delivery_id)?.attempt ?? 0) + 1;
+		if (attempt >= MAX_DELIVERY_ATTEMPTS) {
+			this.options.store.update_delivery(message.delivery_id, "failed_terminal", {
 				last_error: detail,
 				increment_attempt: true
 			});
-			probe("inbound", "message.failed", {
+			probe("inbound", "message.failed_terminal", {
 				delivery_id: message.delivery_id,
 				attempt,
 				error: detail
 			});
-			throw error;
+			this.options.enqueue_outbound({
+				session_id: this.options.store.get_session_id(message.user_id) ?? `weixin-${message.user_id}`,
+				user_id: message.user_id,
+				kind: "error",
+				text: "（这条消息处理失败了，我已经记录下来；请稍后再发一次或告诉我换种说法）",
+				...message.context_token === void 0 ? {} : { context_token: message.context_token }
+			});
+			return;
 		}
+		this.options.store.update_delivery(message.delivery_id, "failed_retryable", {
+			last_error: detail,
+			increment_attempt: true
+		});
+		probe("inbound", "message.failed", {
+			delivery_id: message.delivery_id,
+			attempt,
+			error: detail
+		});
 	}
 	/** 应用控制命令（幂等：delivery 已登记过就不会重复执行）。 */
 	async apply_control(message, control) {
@@ -2030,13 +2037,13 @@ var InboundCoordinator = class {
 			await this.inject_message(message);
 			return;
 		}
-		this.options.store.update_delivery(message.delivery_id, "routing", { expect: "received" });
+		this.begin_routing(message.delivery_id);
 		const existing = this.coalesced.get(message.user_id);
 		if (existing !== void 0) clearTimeout(existing.timer);
 		const messages = [...existing?.messages ?? [], message];
 		const first_at = existing?.first_at ?? Date.now();
 		const timer = setTimeout(() => {
-			this.flush_coalesced(message.user_id);
+			this.enqueue_for_user(message, () => this.flush_coalesced(message.user_id)).catch((error) => probe("inbound", "coalesce.scheduler_failed", { error: String(error) }));
 		}, COALESCE_MS);
 		this.coalesced.set(message.user_id, {
 			messages,
@@ -2073,15 +2080,33 @@ var InboundCoordinator = class {
 				user_id,
 				error: String(error)
 			});
+			for (const message of bucket.messages) this.handle_message_failure(message, error);
 		}
+	}
+	/** delivery_id 为已登记投递；复用既有 routing，只从明确可处理状态进入路由。 */
+	begin_routing(delivery_id) {
+		const row = this.options.store.get_delivery(delivery_id);
+		if (row?.status === "routing") return;
+		const status = row?.status ?? "received";
+		if (status !== "received" && status !== "failed_retryable") throw new Error(`delivery 不可路由：${status}`);
+		if (this.options.store.update_delivery(delivery_id, "routing", { expect: status }) === false) throw new Error("delivery 状态已变更，路由未获得所有权");
+	}
+	/** 无参数；取消尚未到期的合并计时器，保留数据库载荷供下次恢复。 */
+	async dispose() {
+		this.disposed = true;
+		for (const bucket of this.coalesced.values()) clearTimeout(bucket.timer);
+		this.coalesced.clear();
+		this.coalesced_last_at.clear();
+		await Promise.allSettled([...this.shards.values()].map((shard) => shard.chain));
 	}
 	/** 普通消息：媒体 → Agent → followup → 标记 injected。 */
 	async inject_message(message, also_mark = []) {
+		if (this.disposed) return;
 		const done = probe_timer("inbound", "message.inject", {
 			delivery_id: message.delivery_id,
 			user_id: message.user_id
 		});
-		this.options.store.update_delivery(message.delivery_id, "routing", { expect: "received" });
+		this.begin_routing(message.delivery_id);
 		const text = message.text.trim();
 		if (!text && message.media.length > 0) {
 			const pending = this.pending_media.get(message.user_id) ?? [];
@@ -2109,15 +2134,15 @@ var InboundCoordinator = class {
 			this.options.store.set_session_id(message.user_id, session_id);
 		}
 		const session_key = String(agent.id);
+		if (this.disposed) return;
 		this.options.on_agent_ready?.(agent);
 		this.options.on_agent_bound?.(agent);
 		if (message.context_token !== void 0) this.latest_token.set(message.user_id, message.context_token);
-		if (this.options.send_media !== void 0 && !this.media_bound.has(session_key)) {
-			this.media_bound.add(session_key);
+		if (this.options.send_media !== void 0) {
 			const send_media = this.options.send_media;
 			const latest_token = this.latest_token;
 			const user_id = message.user_id;
-			agent.ctx.tools.register(defineTool({
+			const media_tool = defineTool({
 				name: "send_file",
 				description: "把本地图片发到当前微信聊天（只支持 jpg/png/gif/webp 等图片；文件暂不支持）。用户说\"发我\"\"发过来\"\"截图给我\"时用它。",
 				parameters: { path: {
@@ -2163,7 +2188,14 @@ var InboundCoordinator = class {
 						};
 					}
 				}
-			}));
+			});
+			const current = agent.ctx.tools.get("send_file", agent);
+			if (current === void 0) agent.ctx.tools.register(media_tool);
+			else {
+				current.description = media_tool.description;
+				current.parameters = media_tool.parameters;
+				current.execute = media_tool.execute;
+			}
 		}
 		this.options.on_user_message?.(session_key, message.user_id, text);
 		const content = await this.build_content(text, media);
@@ -2180,6 +2212,7 @@ var InboundCoordinator = class {
 				summary: "微信消息"
 			}
 		});
+		if (this.disposed) return;
 		if (agent.status !== "idle") {
 			agent.steer(incoming);
 			probe("inbound", "message.steer", {
@@ -2276,17 +2309,13 @@ var InboundCoordinator = class {
 						user_id: record.user_id,
 						from_status: record.status
 					});
-					await this.process_message(message);
+					await this.enqueue_for_user(message);
 					reinjected += 1;
 					continue;
 				}
 			}
-			const session_id = record.session_id ?? this.options.store.get_session_id(record.user_id);
-			if (session_id !== void 0) this.options.store.update_delivery(record.delivery_id, "injected", {
-				session_id,
-				injected_at: Date.now()
-			});
-			else needs_reinject += 1;
+			needs_reinject += 1;
+			this.options.store.update_delivery(record.delivery_id, "failed_terminal", { last_error: "无法恢复：入站载荷缺失，未重新执行" });
 		}
 		probe("inbound", "recover.done", {
 			unfinished: unfinished.length,
@@ -5512,6 +5541,31 @@ function iso(ts, timezone) {
 	return `${parts.replace(", ", "T").replace(/\//g, "-")}${zone}`;
 }
 //#endregion
+//#region lib/types/memory/MemoryToolRegistry.js
+var MemoryToolRegistry = class {
+	static bound = /* @__PURE__ */ new WeakMap();
+	/** ctx 为作用域，key 为工具组，install 接收受事务保护的注册函数；成功后记录，卸载时移除。 */
+	static register_tools(ctx, key, install) {
+		const groups = this.bound.get(ctx) ?? /* @__PURE__ */ new Set();
+		if (groups.has(key)) return;
+		const releases = [];
+		try {
+			install((tool) => {
+				releases.push(ctx.tools.register(tool));
+			});
+		} catch (error) {
+			for (const release of releases.reverse()) release();
+			throw error;
+		}
+		groups.add(key);
+		this.bound.set(ctx, groups);
+		ctx.effect(() => () => {
+			for (const release of releases.reverse()) release();
+			groups.delete(key);
+		}, `shared-memory.${key}`);
+	}
+};
+//#endregion
 //#region lib/types/memory/timelineTools.js
 /**
 * 长期记忆（时间线）的三层工具接口。
@@ -5550,228 +5604,230 @@ function as_date(value) {
 * @param store - 时间线存储。
 */
 function register_timeline_tools(agent_ctx, store) {
-	agent_ctx.tools.register(defineTool({
-		name: "timeline_days",
-		description: [
-			"查看\"长期记忆里有哪些天\"，以及每天的对话条数和当天摘要。这是最便宜的一层。",
-			"",
-			"什么时候该用：",
-			"- 用户提到\"前几天/上次/最近\"这类模糊时间，你不确定具体是哪天；",
-			"- 用户问\"这几天都聊了什么/最近怎么样\"；",
-			"- 你想先看看记忆里有没有相关内容，再决定要不要细查。",
-			"",
-			"什么时候不该用：",
-			"- 当前对话里已经有的信息，不要为了\"确认\"再查一遍；",
-			"- 与用户当前请求无关时，不要为了\"更了解他\"而主动翻记忆。",
-			"",
-			"用法建议：先调用它拿到日期，再用 timeline_read 读某一天的细节。"
-		].join("\n"),
-		parameters: {
-			limit: {
-				type: "number",
-				description: "最多列出最近多少天，默认 14。"
-			},
-			include_summary: {
-				type: "boolean",
-				description: "是否一并返回每天的摘要（默认 true；关掉只返回日期与条数，更省）。"
-			}
-		},
-		output: {
-			schema: {
-				type: "object",
-				additionalProperties: false,
-				properties: {
-					ok: {
-						type: "boolean",
-						required: true
-					},
-					text: {
-						type: "string",
-						required: true
-					}
+	MemoryToolRegistry.register_tools(agent_ctx, "timeline", (register) => {
+		register(defineTool({
+			name: "timeline_days",
+			description: [
+				"查看\"长期记忆里有哪些天\"，以及每天的对话条数和当天摘要。这是最便宜的一层。",
+				"",
+				"什么时候该用：",
+				"- 用户提到\"前几天/上次/最近\"这类模糊时间，你不确定具体是哪天；",
+				"- 用户问\"这几天都聊了什么/最近怎么样\"；",
+				"- 你想先看看记忆里有没有相关内容，再决定要不要细查。",
+				"",
+				"什么时候不该用：",
+				"- 当前对话里已经有的信息，不要为了\"确认\"再查一遍；",
+				"- 与用户当前请求无关时，不要为了\"更了解他\"而主动翻记忆。",
+				"",
+				"用法建议：先调用它拿到日期，再用 timeline_read 读某一天的细节。"
+			].join("\n"),
+			parameters: {
+				limit: {
+					type: "number",
+					description: "最多列出最近多少天，默认 14。"
+				},
+				include_summary: {
+					type: "boolean",
+					description: "是否一并返回每天的摘要（默认 true；关掉只返回日期与条数，更省）。"
 				}
 			},
-			render: (_args, value) => [{
-				type: "text",
-				text: String(value.text ?? "")
-			}]
-		},
-		async execute(args) {
-			const days = store.list_days();
-			if (days.length === 0) return {
-				ok: true,
-				text: "长期记忆里还没有任何记录。"
-			};
-			const limit = Math.max(1, Math.min(120, Number(args.limit) || 14));
-			const picked = days.slice(-limit).reverse();
-			const with_summary = args.include_summary !== false;
-			const lines = picked.map((meta) => {
-				const head = `- ${meta.date}（${meta.entries} 条：用户 ${meta.user_entries} / 我 ${meta.assistant_entries}）`;
-				if (!with_summary) return head;
-				const summary = store.read_summary(meta.date);
-				return summary === void 0 ? `${head}\n  摘要：（尚未生成）` : `${head}\n  摘要：${summary.replace(/\n/g, " / ")}`;
-			});
-			const stats = store.stats();
-			return {
-				ok: true,
-				text: clip$3(`共 ${stats.days} 天记忆（${stats.first_date ?? "?"} ~ ${stats.last_date ?? "?"}），最近 ${picked.length} 天：\n\n` + lines.join("\n"))
-			};
-		}
-	}));
-	agent_ctx.tools.register(defineTool({
-		name: "timeline_search",
-		description: [
-			"在长期记忆里按关键词搜索，返回**命中的日期 + 谁说的 + 片段**。中间层。",
-			"",
-			"什么时候该用：",
-			"- 用户说\"我之前不是说过…/你还记得…吗\"，你要先确认有没有、在哪天；",
-			"- 要回忆某个人名、地点、事项、偏好（例如\"房租\"\"复查\"\"妈妈\"）；",
-			"- 想找某个话题最早/最近一次出现。",
-			"",
-			"什么时候不该用：",
-			"- 别用它来\"遍历所有记忆\"：一次只搜一个具体关键词，不要拿\"的\"\"了\"这类常见字去搜；",
-			"- 已知具体日期时直接用 timeline_read，不必搜。",
-			"",
-			"返回的只是片段；要看上下文，再用 timeline_read 读那一天。"
-		].join("\n"),
-		parameters: {
-			keyword: {
-				type: "string",
-				required: true,
-				description: "要搜索的关键词（例如\"房租\"、\"医院\"）。一次一个，尽量具体。"
-			},
-			from: {
-				type: "string",
-				description: "起始日期 YYYY-MM-DD（可选）。"
-			},
-			to: {
-				type: "string",
-				description: "结束日期 YYYY-MM-DD（可选）。"
-			},
-			limit: {
-				type: "number",
-				description: "最多返回多少条命中，默认 20。"
-			}
-		},
-		output: {
-			schema: {
-				type: "object",
-				additionalProperties: false,
-				properties: {
-					ok: {
-						type: "boolean",
-						required: true
-					},
-					text: {
-						type: "string",
-						required: true
+			output: {
+				schema: {
+					type: "object",
+					additionalProperties: false,
+					properties: {
+						ok: {
+							type: "boolean",
+							required: true
+						},
+						text: {
+							type: "string",
+							required: true
+						}
 					}
+				},
+				render: (_args, value) => [{
+					type: "text",
+					text: String(value.text ?? "")
+				}]
+			},
+			async execute(args) {
+				const days = store.list_days();
+				if (days.length === 0) return {
+					ok: true,
+					text: "长期记忆里还没有任何记录。"
+				};
+				const limit = Math.max(1, Math.min(120, Number(args.limit) || 14));
+				const picked = days.slice(-limit).reverse();
+				const with_summary = args.include_summary !== false;
+				const lines = picked.map((meta) => {
+					const head = `- ${meta.date}（${meta.entries} 条：用户 ${meta.user_entries} / 我 ${meta.assistant_entries}）`;
+					if (!with_summary) return head;
+					const summary = store.read_summary(meta.date);
+					return summary === void 0 ? `${head}\n  摘要：（尚未生成）` : `${head}\n  摘要：${summary.replace(/\n/g, " / ")}`;
+				});
+				const stats = store.stats();
+				return {
+					ok: true,
+					text: clip$3(`共 ${stats.days} 天记忆（${stats.first_date ?? "?"} ~ ${stats.last_date ?? "?"}），最近 ${picked.length} 天：\n\n` + lines.join("\n"))
+				};
+			}
+		}));
+		register(defineTool({
+			name: "timeline_search",
+			description: [
+				"在长期记忆里按关键词搜索，返回**命中的日期 + 谁说的 + 片段**。中间层。",
+				"",
+				"什么时候该用：",
+				"- 用户说\"我之前不是说过…/你还记得…吗\"，你要先确认有没有、在哪天；",
+				"- 要回忆某个人名、地点、事项、偏好（例如\"房租\"\"复查\"\"妈妈\"）；",
+				"- 想找某个话题最早/最近一次出现。",
+				"",
+				"什么时候不该用：",
+				"- 别用它来\"遍历所有记忆\"：一次只搜一个具体关键词，不要拿\"的\"\"了\"这类常见字去搜；",
+				"- 已知具体日期时直接用 timeline_read，不必搜。",
+				"",
+				"返回的只是片段；要看上下文，再用 timeline_read 读那一天。"
+			].join("\n"),
+			parameters: {
+				keyword: {
+					type: "string",
+					required: true,
+					description: "要搜索的关键词（例如\"房租\"、\"医院\"）。一次一个，尽量具体。"
+				},
+				from: {
+					type: "string",
+					description: "起始日期 YYYY-MM-DD（可选）。"
+				},
+				to: {
+					type: "string",
+					description: "结束日期 YYYY-MM-DD（可选）。"
+				},
+				limit: {
+					type: "number",
+					description: "最多返回多少条命中，默认 20。"
 				}
 			},
-			render: (_args, value) => [{
-				type: "text",
-				text: String(value.text ?? "")
-			}]
-		},
-		async execute(args) {
-			const keyword = typeof args.keyword === "string" ? args.keyword.trim() : "";
-			if (keyword === "") return {
-				ok: false,
-				text: "需要一个非空 keyword。"
-			};
-			const from = as_date(args.from);
-			const to = as_date(args.to);
-			const hits = store.search(keyword, {
-				limit: Math.max(1, Math.min(100, Number(args.limit) || 20)),
-				...from === void 0 ? {} : { from },
-				...to === void 0 ? {} : { to }
-			});
-			if (hits.length === 0) return {
-				ok: true,
-				text: `没有找到包含"${keyword}"的记录。不要猜内容，如实告诉用户没找到。`
-			};
-			const lines = hits.map((hit) => `- ${hit.date} ${hit.entry.role === "user" ? "用户" : "我"}：${hit.entry.text.replace(/\n/g, " ")}`);
-			return {
-				ok: true,
-				text: clip$3(`包含"${keyword}"的记录（${hits.length} 条，新的在前）：\n\n${lines.join("\n")}\n\n要看完整上下文，用 timeline_read 读对应日期。`)
-			};
-		}
-	}));
-	agent_ctx.tools.register(defineTool({
-		name: "timeline_read",
-		description: [
-			"读某一天（或一段日期）的长期记忆：**当天的摘要 + 逐句原文**。最贵的一层，请最后用。",
-			"",
-			"什么时候该用：",
-			"- 已经用 timeline_search / timeline_days 定位到某天，现在需要看当时到底说了什么；",
-			"- 用户明确问\"X 月 X 日那天我们聊了什么\"；",
-			"- 要恢复某个事项的完整背景（时间、数字、承诺）。",
-			"",
-			"什么时候不该用：",
-			"- **不要**为了回答普通问题而一次读很多天；单次最多读 3 天，且优先只读摘要确认真有需要再看原文；",
-			"- 不要凭记忆里的\"大概日期\"反复试错；不确定日期就先 timeline_days。",
-			"",
-			"注意：这些是用户说过的原话与你的历史回复，属于隐私内容，只用于回答用户本人。"
-		].join("\n"),
-		parameters: {
-			date: {
-				type: "string",
-				required: true,
-				description: "要读取的日期 YYYY-MM-DD。"
-			},
-			to: {
-				type: "string",
-				description: "结束日期 YYYY-MM-DD（可选）。给区间时会读多天，单次最多 3 天。"
-			},
-			include_entries: {
-				type: "boolean",
-				description: "是否包含逐句原文（默认 true）。只想看摘要时设 false，更省。"
-			}
-		},
-		output: {
-			schema: {
-				type: "object",
-				additionalProperties: false,
-				properties: {
-					ok: {
-						type: "boolean",
-						required: true
-					},
-					text: {
-						type: "string",
-						required: true
+			output: {
+				schema: {
+					type: "object",
+					additionalProperties: false,
+					properties: {
+						ok: {
+							type: "boolean",
+							required: true
+						},
+						text: {
+							type: "string",
+							required: true
+						}
 					}
+				},
+				render: (_args, value) => [{
+					type: "text",
+					text: String(value.text ?? "")
+				}]
+			},
+			async execute(args) {
+				const keyword = typeof args.keyword === "string" ? args.keyword.trim() : "";
+				if (keyword === "") return {
+					ok: false,
+					text: "需要一个非空 keyword。"
+				};
+				const from = as_date(args.from);
+				const to = as_date(args.to);
+				const hits = store.search(keyword, {
+					limit: Math.max(1, Math.min(100, Number(args.limit) || 20)),
+					...from === void 0 ? {} : { from },
+					...to === void 0 ? {} : { to }
+				});
+				if (hits.length === 0) return {
+					ok: true,
+					text: `没有找到包含"${keyword}"的记录。不要猜内容，如实告诉用户没找到。`
+				};
+				const lines = hits.map((hit) => `- ${hit.date} ${hit.entry.role === "user" ? "用户" : "我"}：${hit.entry.text.replace(/\n/g, " ")}`);
+				return {
+					ok: true,
+					text: clip$3(`包含"${keyword}"的记录（${hits.length} 条，新的在前）：\n\n${lines.join("\n")}\n\n要看完整上下文，用 timeline_read 读对应日期。`)
+				};
+			}
+		}));
+		register(defineTool({
+			name: "timeline_read",
+			description: [
+				"读某一天（或一段日期）的长期记忆：**当天的摘要 + 逐句原文**。最贵的一层，请最后用。",
+				"",
+				"什么时候该用：",
+				"- 已经用 timeline_search / timeline_days 定位到某天，现在需要看当时到底说了什么；",
+				"- 用户明确问\"X 月 X 日那天我们聊了什么\"；",
+				"- 要恢复某个事项的完整背景（时间、数字、承诺）。",
+				"",
+				"什么时候不该用：",
+				"- **不要**为了回答普通问题而一次读很多天；单次最多读 3 天，且优先只读摘要确认真有需要再看原文；",
+				"- 不要凭记忆里的\"大概日期\"反复试错；不确定日期就先 timeline_days。",
+				"",
+				"注意：这些是用户说过的原话与你的历史回复，属于隐私内容，只用于回答用户本人。"
+			].join("\n"),
+			parameters: {
+				date: {
+					type: "string",
+					required: true,
+					description: "要读取的日期 YYYY-MM-DD。"
+				},
+				to: {
+					type: "string",
+					description: "结束日期 YYYY-MM-DD（可选）。给区间时会读多天，单次最多 3 天。"
+				},
+				include_entries: {
+					type: "boolean",
+					description: "是否包含逐句原文（默认 true）。只想看摘要时设 false，更省。"
 				}
 			},
-			render: (_args, value) => [{
-				type: "text",
-				text: String(value.text ?? "")
-			}]
-		},
-		async execute(args) {
-			const date = as_date(args.date);
-			if (date === void 0) return {
-				ok: false,
-				text: "date 必须是 YYYY-MM-DD 格式。"
-			};
-			const to = as_date(args.to) ?? date;
-			const non_empty = store.read_range(date, to).filter((day) => day.entries.length > 0);
-			if (non_empty.length === 0) return {
-				ok: true,
-				text: `${date}${to === date ? "" : " ~ " + to} 没有对话记录。不要编造内容。`
-			};
-			const with_entries = args.include_entries !== false;
-			return {
-				ok: true,
-				text: clip$3(non_empty.map((day) => {
-					const head = `## ${day.meta.date}（${day.meta.entries} 条）`;
-					const summary = `摘要：${day.summary ?? "（尚未生成）"}`;
-					if (!with_entries) return `${head}\n${summary}`;
-					return `${head}\n${summary}\n\n${day.entries.map((item) => `[${item.role === "user" ? "用户" : "我"}] ${item.text}`).join("\n")}`;
-				}).join("\n\n"))
-			};
-		}
-	}));
+			output: {
+				schema: {
+					type: "object",
+					additionalProperties: false,
+					properties: {
+						ok: {
+							type: "boolean",
+							required: true
+						},
+						text: {
+							type: "string",
+							required: true
+						}
+					}
+				},
+				render: (_args, value) => [{
+					type: "text",
+					text: String(value.text ?? "")
+				}]
+			},
+			async execute(args) {
+				const date = as_date(args.date);
+				if (date === void 0) return {
+					ok: false,
+					text: "date 必须是 YYYY-MM-DD 格式。"
+				};
+				const to = as_date(args.to) ?? date;
+				const non_empty = store.read_range(date, to).filter((day) => day.entries.length > 0);
+				if (non_empty.length === 0) return {
+					ok: true,
+					text: `${date}${to === date ? "" : " ~ " + to} 没有对话记录。不要编造内容。`
+				};
+				const with_entries = args.include_entries !== false;
+				return {
+					ok: true,
+					text: clip$3(non_empty.map((day) => {
+						const head = `## ${day.meta.date}（${day.meta.entries} 条）`;
+						const summary = `摘要：${day.summary ?? "（尚未生成）"}`;
+						if (!with_entries) return `${head}\n${summary}`;
+						return `${head}\n${summary}\n\n${day.entries.map((item) => `[${item.role === "user" ? "用户" : "我"}] ${item.text}`).join("\n")}`;
+					}).join("\n\n"))
+				};
+			}
+		}));
+	});
 }
 //#endregion
 //#region lib/types/memory/graphTypes.js
@@ -6447,121 +6503,123 @@ function relation_lines(graph, id) {
 * @param graph - 知识图谱存储。
 */
 function register_graph_tools(agent_ctx, graph) {
-	agent_ctx.tools.register(defineTool({
-		name: "relation_query",
-		description: [
-			"查询家人/朋友关系（知识图谱）。这张图**以「欣爱」（你自己）为中心**：",
-			"不填 from 就默认从欣爱出发，所以\"主人和 XX 是什么关系\"直接给 to 即可。",
-			"图谱里的两个固定节点：`欣爱`（你）与 `主人`（用户本人，真名可能在他的别名里）。",
-			"",
-			"两种用法：",
-			"- 只给 to：查\"欣爱 → to\"的链路，也就是这个人和这个家是什么关系；",
-			"- 只给 from：查这个人的资料 + 他身边都有谁（向外 2 层）；",
-			"- 同时给 from 和 to：查两人的关系链路，**会自动递归多跳**，",
-			"  例如\"小红是小明的朋友，小红的朋友是老王\"。",
-			"",
-			"什么时候该用：",
-			"- 用户问\"XX 是谁/XX 的电话/XX 在哪/XX 是我什么人\"（\"我\"就是 `主人`）；",
-			"- 用户提到一个你不认识的人名，需要先查一下再回答；",
-			"- 需要理清\"谁的谁\"这种链路（亲戚、朋友的朋友）。",
-			"",
-			"什么时候不该用：",
-			"- 当前对话里已经说清楚的信息，不要为了确认再查；",
-			"- 用户只是闲聊、不涉及具体人物时不要调用。",
-			"",
-			"返回的是图谱里**已记录**的内容；如果没这个人或没有通路，会如实告诉你，",
-			"不要据此编造关系或属性。"
-		].join("\n"),
-		parameters: {
-			from: {
-				type: "string",
-				description: "起点人物姓名（或已知别名）；不填默认「欣爱」。"
-			},
-			to: {
-				type: "string",
-				description: "终点人物姓名；给了就查两人之间的关系链路。"
-			},
-			max_depth: {
-				type: "number",
-				description: "链路最多几跳，默认 4。"
-			}
-		},
-		output: {
-			schema: {
-				type: "object",
-				additionalProperties: false,
-				properties: {
-					ok: {
-						type: "boolean",
-						required: true
-					},
-					text: {
-						type: "string",
-						required: true
-					}
+	MemoryToolRegistry.register_tools(agent_ctx, "graph", (register) => {
+		register(defineTool({
+			name: "relation_query",
+			description: [
+				"查询家人/朋友关系（知识图谱）。这张图**以「欣爱」（你自己）为中心**：",
+				"不填 from 就默认从欣爱出发，所以\"主人和 XX 是什么关系\"直接给 to 即可。",
+				"图谱里的两个固定节点：`欣爱`（你）与 `主人`（用户本人，真名可能在他的别名里）。",
+				"",
+				"两种用法：",
+				"- 只给 to：查\"欣爱 → to\"的链路，也就是这个人和这个家是什么关系；",
+				"- 只给 from：查这个人的资料 + 他身边都有谁（向外 2 层）；",
+				"- 同时给 from 和 to：查两人的关系链路，**会自动递归多跳**，",
+				"  例如\"小红是小明的朋友，小红的朋友是老王\"。",
+				"",
+				"什么时候该用：",
+				"- 用户问\"XX 是谁/XX 的电话/XX 在哪/XX 是我什么人\"（\"我\"就是 `主人`）；",
+				"- 用户提到一个你不认识的人名，需要先查一下再回答；",
+				"- 需要理清\"谁的谁\"这种链路（亲戚、朋友的朋友）。",
+				"",
+				"什么时候不该用：",
+				"- 当前对话里已经说清楚的信息，不要为了确认再查；",
+				"- 用户只是闲聊、不涉及具体人物时不要调用。",
+				"",
+				"返回的是图谱里**已记录**的内容；如果没这个人或没有通路，会如实告诉你，",
+				"不要据此编造关系或属性。"
+			].join("\n"),
+			parameters: {
+				from: {
+					type: "string",
+					description: "起点人物姓名（或已知别名）；不填默认「欣爱」。"
+				},
+				to: {
+					type: "string",
+					description: "终点人物姓名；给了就查两人之间的关系链路。"
+				},
+				max_depth: {
+					type: "number",
+					description: "链路最多几跳，默认 4。"
 				}
 			},
-			render: (_args, value) => [{
-				type: "text",
-				text: String(value.text ?? "")
-			}]
-		},
-		async execute(args) {
-			const from = typeof args.from === "string" ? args.from.trim() : "";
-			const to = typeof args.to === "string" ? args.to.trim() : "";
-			if (from === "" && to === "") return {
-				ok: false,
-				text: "至少要给 from 或 to 一个人名。"
-			};
-			const origin = from === "" ? GRAPH_ASSISTANT_NAME : from;
-			const start = graph.find(origin);
-			if (start === void 0) {
-				const known = graph.nodes().map((node) => node.name).slice(0, 30);
-				return {
-					ok: true,
-					text: known.length === 0 ? "知识图谱里还没有任何人物记录。" : `没有找到"${origin}"。目前记录在册的人有：${known.join("、")}。请确认名字，或如实告诉用户你还不认识这个人。`
+			output: {
+				schema: {
+					type: "object",
+					additionalProperties: false,
+					properties: {
+						ok: {
+							type: "boolean",
+							required: true
+						},
+						text: {
+							type: "string",
+							required: true
+						}
+					}
+				},
+				render: (_args, value) => [{
+					type: "text",
+					text: String(value.text ?? "")
+				}]
+			},
+			async execute(args) {
+				const from = typeof args.from === "string" ? args.from.trim() : "";
+				const to = typeof args.to === "string" ? args.to.trim() : "";
+				if (from === "" && to === "") return {
+					ok: false,
+					text: "至少要给 from 或 to 一个人名。"
 				};
-			}
-			const max_depth = Number(args.max_depth) || 4;
-			if (to === "") {
-				const attributes = graph.attributes(start.name);
-				const ring = graph.neighborhood(start.name, { max_depth: 2 });
-				const lines = [`【${start.name}】${describe_person(attributes ?? start)}`];
-				if (ring.length > 0) {
-					lines.push("");
-					lines.push("关系网（他/她怎么称呼别人）：");
-					for (const item of ring) lines.push(`- ${item.label}：${item.name}${item.depth > 1 ? `（${item.depth} 层关系）` : ""}`);
-				} else lines.push("", "（图谱里还没有这个人的关系记录）");
+				const origin = from === "" ? GRAPH_ASSISTANT_NAME : from;
+				const start = graph.find(origin);
+				if (start === void 0) {
+					const known = graph.nodes().map((node) => node.name).slice(0, 30);
+					return {
+						ok: true,
+						text: known.length === 0 ? "知识图谱里还没有任何人物记录。" : `没有找到"${origin}"。目前记录在册的人有：${known.join("、")}。请确认名字，或如实告诉用户你还不认识这个人。`
+					};
+				}
+				const max_depth = Number(args.max_depth) || 4;
+				if (to === "") {
+					const attributes = graph.attributes(start.name);
+					const ring = graph.neighborhood(start.name, { max_depth: 2 });
+					const lines = [`【${start.name}】${describe_person(attributes ?? start)}`];
+					if (ring.length > 0) {
+						lines.push("");
+						lines.push("关系网（他/她怎么称呼别人）：");
+						for (const item of ring) lines.push(`- ${item.label}：${item.name}${item.depth > 1 ? `（${item.depth} 层关系）` : ""}`);
+					} else lines.push("", "（图谱里还没有这个人的关系记录）");
+					return {
+						ok: true,
+						text: clip$2(lines.join("\n"))
+					};
+				}
+				const end = graph.find(to);
+				if (end === void 0) return {
+					ok: true,
+					text: `没有找到"${to}"。目前记录在册的人有：${graph.nodes().map((node) => node.name).slice(0, 30).join("、")}。`
+				};
+				const paths = graph.paths(start.name, end.name, { max_depth });
+				if (paths.length === 0) return {
+					ok: true,
+					text: `图谱里没有从"${start.name}"到"${end.name}"的关系链路（最多找了 ${max_depth} 跳）。不要据此编造关系；如果用户说了他们的关系，可以在回复里请用户确认。`
+				};
+				const lines = [
+					`【${start.name}】${describe_person(graph.attributes(start.name) ?? start)}`,
+					...relation_lines(graph, start.id),
+					`【${end.name}】${describe_person(graph.attributes(end.name) ?? end)}`,
+					...relation_lines(graph, end.id),
+					"",
+					`找到 ${paths.length} 条关系链路：`
+				];
+				for (const path of paths.slice(0, 5)) lines.push(`- ${path.readable}（${path.hops.length} 跳）`);
 				return {
 					ok: true,
 					text: clip$2(lines.join("\n"))
 				};
 			}
-			const end = graph.find(to);
-			if (end === void 0) return {
-				ok: true,
-				text: `没有找到"${to}"。目前记录在册的人有：${graph.nodes().map((node) => node.name).slice(0, 30).join("、")}。`
-			};
-			const paths = graph.paths(start.name, end.name, { max_depth });
-			if (paths.length === 0) return {
-				ok: true,
-				text: `图谱里没有从"${start.name}"到"${end.name}"的关系链路（最多找了 ${max_depth} 跳）。不要据此编造关系；如果用户说了他们的关系，可以在回复里请用户确认。`
-			};
-			const lines = [
-				`【${start.name}】${describe_person(graph.attributes(start.name) ?? start)}`,
-				...relation_lines(graph, start.id),
-				`【${end.name}】${describe_person(graph.attributes(end.name) ?? end)}`,
-				...relation_lines(graph, end.id),
-				"",
-				`找到 ${paths.length} 条关系链路：`
-			];
-			for (const path of paths.slice(0, 5)) lines.push(`- ${path.readable}（${path.hops.length} 跳）`);
-			return {
-				ok: true,
-				text: clip$2(lines.join("\n"))
-			};
-		}
-	}));
+		}));
+	});
 }
 //#endregion
 //#region lib/types/memory/graphProtocol.js
@@ -8904,6 +8962,7 @@ var WeixinConnector = class {
 	opencode_watcher;
 	controller = new AbortController();
 	stream_disposers = /* @__PURE__ */ new Map();
+	stream_agents = /* @__PURE__ */ new Map();
 	observation_disposers;
 	/** 每个 Stream 的工具调用计数（用于"每 N 次工具调用推一次摘要"）。 */
 	tool_calls_seen = /* @__PURE__ */ new Map();
@@ -9053,6 +9112,7 @@ var WeixinConnector = class {
 			store: this.store,
 			turn_context: this.turn_context,
 			sender: async (input) => {
+				if (!this.lease.is_held()) throw new Error("微信消费者所有权已丢失，停止发送");
 				await this.client.send_message_with_retry({
 					to_user_id: input.user_id,
 					text: input.text,
@@ -9131,8 +9191,10 @@ var WeixinConnector = class {
 				this.outbound.enqueue_notice(input);
 			},
 			send_media: async (user_id, path, context_token) => {
+				if (!this.lease.is_held()) throw new Error("微信消费者所有权已丢失，停止发送媒体");
 				const { readFile } = await import("node:fs/promises");
 				const data = new Uint8Array(await readFile(path));
+				if (!this.lease.is_held()) throw new Error("微信消费者所有权已丢失，停止发送媒体");
 				await this.client.send_image({
 					to_user_id: user_id,
 					data,
@@ -9417,10 +9479,17 @@ var WeixinConnector = class {
 		const probe_id = `preset-check-${Date.now().toString(36)}`;
 		let failure = "";
 		try {
-			await this.host.create_agent(brandString(probe_id));
+			const agent = await this.host.create_agent(brandString(probe_id));
+			if (this.timeline !== void 0) {
+				register_timeline_tools(agent.ctx, this.timeline);
+				register_graph_tools(agent.ctx, this.graph);
+			}
+			this.bind_agent_stream(agent);
+			this.bind_agent_stream(agent);
 		} catch (error) {
 			failure = error instanceof Error ? error.message : String(error);
 		} finally {
+			this.forget_session(probe_id);
 			await this.host.dispose_agent(probe_id);
 			delete_session_artifacts({
 				root: sessions_root(),
@@ -9433,7 +9502,10 @@ var WeixinConnector = class {
 			throw new Error(`preset 组装失败，已回滚：${failure}`);
 		}
 		probe("lifecycle", "preset.reloaded", {});
-		return { reloaded: true };
+		return {
+			reloaded: true,
+			routing_checked: true
+		};
 	}
 	/** 丢掉某个会话在内存里的残留状态（上下文已经清掉，这些映射不能再留着）。 */
 	forget_session(session_id) {
@@ -9446,6 +9518,7 @@ var WeixinConnector = class {
 			});
 		}
 		this.stream_disposers.delete(session_id);
+		this.stream_agents.delete(session_id);
 		this.tool_calls_seen.delete(session_id);
 		this.current_turn.delete(session_id);
 		this.last_progress_at.delete(session_id);
@@ -9628,9 +9701,17 @@ var WeixinConnector = class {
 		/** 游标连续被卡住的次数；用于退避，避免服务端立刻重投造成热循环。 */
 		let cursor_stall = 0;
 		while (!this.controller.signal.aborted && !this.stopped) {
+			if (!this.lease.is_held()) {
+				this.controller.abort();
+				this.outbound.stop();
+				await this.inbound.dispose();
+				probe("lifecycle", "lease.lost_stop");
+				return;
+			}
 			this.outbound.drain();
 			const cursor = this.store.get_cursor();
 			const result = await this.ingress.poll(cursor, this.controller.signal);
+			if (!this.lease.is_held()) continue;
 			switch (result.kind) {
 				case "messages": {
 					backoff_index = 0;
@@ -9689,7 +9770,8 @@ var WeixinConnector = class {
 	/** 桥接 assistant-stream：聚合成正文、按 turn 绑定上下文、驱动进度/心跳。 */
 	bind_agent_stream(agent) {
 		const session_id = String(agent.id);
-		if (this.stream_disposers.has(session_id)) return;
+		if (this.stream_agents.get(session_id) === agent) return;
+		this.stream_disposers.get(session_id)?.();
 		if (this.timeline !== void 0) agent.ctx.effect(() => {
 			register_timeline_tools(agent.ctx, this.timeline);
 			register_graph_tools(agent.ctx, this.graph);
@@ -9756,6 +9838,7 @@ var WeixinConnector = class {
 			dispose_compaction();
 			ObservationRecorder.forget_session(session_id);
 		});
+		this.stream_agents.set(session_id, agent);
 		probe("lifecycle", "stream.bound", { session_id });
 	}
 	/**
@@ -10262,6 +10345,8 @@ var WeixinConnector = class {
 		this.graph_scheduler = void 0;
 		for (const dispose of this.stream_disposers.values()) dispose();
 		this.stream_disposers.clear();
+		this.stream_agents.clear();
+		await this.inbound.dispose();
 		this.aggregators.clear();
 		this.tool_calls_seen.clear();
 		await this.outbound.drain().catch(() => void 0);
@@ -11144,4 +11229,4 @@ function apply(ctx, config) {
 	install_weixin_connector(ctx, config);
 }
 //#endregion
-export { Config, ConsumerLease, GRAPH_ASSISTANT_NAME, GRAPH_USER_NAME, HarnessSessionHost, INFLIGHT_TURN_PREFIX, IlinkClient, InboundCoordinator, KnowledgeGraphStore, MessageNormalizer, OutboundCoordinator, ReplyAggregator, STATE_SCHEMA_VERSION, TimelineStore, TurnContextStore, WeixinConnector, WeixinIngress, WeixinStateStore, apply, decrypt_aes_ecb, get_shared_memory, inject, install_weixin_connector, is_cursor_committable, merge_messages, migrate_legacy_route_state, name, parse_aes_key, parse_control_command, preflight_openclaw_isolation, probe, probe_enabled, probe_timer, register_graph_tools, register_timeline_tools, set_shared_memory, trace_to_file, transcode_silk_to_wav };
+export { Config, ConsumerLease, GRAPH_ASSISTANT_NAME, GRAPH_USER_NAME, HarnessSessionHost, INFLIGHT_TURN_PREFIX, IlinkClient, InboundCoordinator, KnowledgeGraphStore, MessageNormalizer, OutboundCoordinator, ReplyAggregator, STATE_SCHEMA_VERSION, TimelineStore, TurnContextStore, WeixinConnector, WeixinIngress, WeixinStateStore, apply, decrypt_aes_ecb, get_shared_memory, inject, install_weixin_connector, is_cursor_committable, lease_holder_alive, merge_messages, migrate_legacy_route_state, name, parse_aes_key, parse_control_command, preflight_openclaw_isolation, probe, probe_enabled, probe_timer, register_graph_tools, register_timeline_tools, set_shared_memory, trace_to_file, transcode_silk_to_wav };

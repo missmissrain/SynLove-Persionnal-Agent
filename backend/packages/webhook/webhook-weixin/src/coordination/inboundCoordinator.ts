@@ -239,10 +239,9 @@ interface UserShard {
 
 /** 微信入站协调器。 */
 export class InboundCoordinator {
+  private disposed = false
   private readonly shards = new Map<string, UserShard>()
   private readonly pending_media = new Map<string, NormalizedMedia[]>()
-  /** 已注册 send_file 的会话 */
-  private readonly media_bound = new Set<string>()
   /** 各用户最近一次 context_token（媒体被动回复要用） */
   private readonly latest_token = new Map<string, string>()
   /**
@@ -302,6 +301,10 @@ export class InboundCoordinator {
       })
       if (!first) {
         probe('inbound', 'batch.skip_duplicate', { delivery_id: message.delivery_id })
+        // 上次异步合并失败的消息仍由当前用户分片重试，不再永久跳过。
+        if (this.options.store.get_delivery(message.delivery_id)?.status === 'failed_retryable') {
+          tasks.push(this.enqueue_for_user(message))
+        }
         continue
       }
       // 长期记忆：记下用户这句话（幂等由 delivery_id 保证）。
@@ -335,7 +338,8 @@ export class InboundCoordinator {
   }
 
   /** 把一条消息排进其所属用户的分片链；同用户严格保序，不同用户并发。 */
-  private enqueue_for_user(message: NormalizedWeixinMessage): Promise<void> {
+  private enqueue_for_user(message: NormalizedWeixinMessage, run?: () => Promise<void>): Promise<void> {
+    if (this.disposed) return Promise.resolve()
     const previous = this.shards.get(message.user_id) ?? { chain: Promise.resolve(), depth: 0 }
 
     // **背压**：同一个人堆积太多就不收了。
@@ -363,7 +367,7 @@ export class InboundCoordinator {
     probe('inbound', 'shard.enqueue', { user_id: message.user_id, depth: shard.depth })
 
     const task = shard.chain.then(async () => {
-      await this.process_message(message)
+      await (run === undefined ? this.process_message(message) : run())
     })
     // 链本身吞错（一条失败不能毒化该用户后续消息），但返回值让批次能感知失败。
     shard.chain = task.catch(error => {
@@ -372,7 +376,7 @@ export class InboundCoordinator {
       })
     }).finally(() => {
       const current = this.shards.get(message.user_id)
-      if (current !== undefined && current.chain === shard.chain) {
+      if (current !== undefined) {
         // 保持 depth 计数用于诊断；归零后清理。
         current.depth = Math.max(0, current.depth - 1)
         if (current.depth === 0) this.shards.delete(message.user_id)
@@ -425,6 +429,15 @@ export class InboundCoordinator {
       }
       await this.coalesce_message(message)
     } catch (error) {
+      this.handle_message_failure(message, error)
+    }
+  }
+
+  /** message 为原始投递，error 为处理异常；统一计次、记录原错并在达到上限时发送失败回执。 */
+  private handle_message_failure(message: NormalizedWeixinMessage, error: unknown): void {
+      if (this.disposed) return
+      const current = this.options.store.get_delivery(message.delivery_id)
+      if (current !== undefined && is_cursor_committable(current.status)) return
       const detail = error instanceof Error ? error.message : String(error)
       const attempt = (this.options.store.get_delivery(message.delivery_id)?.attempt ?? 0) + 1
       // 重试上限：超过就转终态。否则「注入失败 → 游标不提交 → 服务端重投 → 又失败」
@@ -450,8 +463,6 @@ export class InboundCoordinator {
         last_error: detail, increment_attempt: true,
       })
       probe('inbound', 'message.failed', { delivery_id: message.delivery_id, attempt, error: detail })
-      throw error
-    }
   }
 
   /** 应用控制命令（幂等：delivery 已登记过就不会重复执行）。 */
@@ -563,14 +574,16 @@ export class InboundCoordinator {
       await this.inject_message(message)
       return
     }
-    this.options.store.update_delivery(message.delivery_id, 'routing', { expect: 'received' })
+    this.begin_routing(message.delivery_id)
 
     const existing = this.coalesced.get(message.user_id)
     if (existing !== undefined) clearTimeout(existing.timer)
     const messages = [...existing?.messages ?? [], message]
     const first_at = existing?.first_at ?? Date.now()
     const timer = setTimeout(() => {
-      void this.flush_coalesced(message.user_id)
+      // 合并窗口到期后仍回到同用户串行链，避免与下一批入站并发修改同一 Agent。
+      const task = this.enqueue_for_user(message, () => this.flush_coalesced(message.user_id))
+      void task.catch(error => probe('inbound', 'coalesce.scheduler_failed', { error: String(error) }))
     }, COALESCE_MS)
     this.coalesced.set(message.user_id, { messages, timer, first_at })
     this.coalesced_last_at.set(message.user_id, Date.now())
@@ -599,15 +612,37 @@ export class InboundCoordinator {
       await this.inject_message(merged, extras)
     } catch (error) {
       probe('inbound', 'coalesce.inject_failed', { user_id, error: String(error) })
+      for (const message of bucket.messages) this.handle_message_failure(message, error)
     }
+  }
+
+  /** delivery_id 为已登记投递；复用既有 routing，只从明确可处理状态进入路由。 */
+  private begin_routing(delivery_id: string): void {
+    const row = this.options.store.get_delivery(delivery_id)
+    if (row?.status === 'routing') return
+    const status = row?.status ?? 'received'
+    if (status !== 'received' && status !== 'failed_retryable') throw new Error(`delivery 不可路由：${status}`)
+    if (this.options.store.update_delivery(delivery_id, 'routing', { expect: status }) === false) {
+      throw new Error('delivery 状态已变更，路由未获得所有权')
+    }
+  }
+
+  /** 无参数；取消尚未到期的合并计时器，保留数据库载荷供下次恢复。 */
+  async dispose(): Promise<void> {
+    this.disposed = true
+    for (const bucket of this.coalesced.values()) clearTimeout(bucket.timer)
+    this.coalesced.clear()
+    this.coalesced_last_at.clear()
+    await Promise.allSettled([...this.shards.values()].map(shard => shard.chain))
   }
 
   /** 普通消息：媒体 → Agent → followup → 标记 injected。 */
   private async inject_message(message: NormalizedWeixinMessage, also_mark: readonly string[] = []): Promise<void> {
+    if (this.disposed) return
     const done = probe_timer('inbound', 'message.inject', {
       delivery_id: message.delivery_id, user_id: message.user_id,
     })
-    this.options.store.update_delivery(message.delivery_id, 'routing', { expect: 'received' })
+    this.begin_routing(message.delivery_id)
 
     const text = message.text.trim()
     // 仅媒体、无文字：缓存等用户补文字，缓存成功即算 control_applied（该 delivery 已处理完）。
@@ -639,16 +674,16 @@ export class InboundCoordinator {
       this.options.store.set_session_id(message.user_id, session_id)
     }
     const session_key = String(agent.id)
+    if (this.disposed) return
     this.options.on_agent_ready?.(agent)
     this.options.on_agent_bound?.(agent)
-    // 媒体回传：每个会话注册一次 send_file（微信通道只支持图片）
+    // 微信/QQ 共用 Agent scope；每次入站恢复当前通道的发送能力。
     if (message.context_token !== undefined) this.latest_token.set(message.user_id, message.context_token)
-    if (this.options.send_media !== undefined && !this.media_bound.has(session_key)) {
-      this.media_bound.add(session_key)
+    if (this.options.send_media !== undefined) {
       const send_media = this.options.send_media
       const latest_token = this.latest_token
       const user_id = message.user_id
-      agent.ctx.tools.register(defineTool({
+      const media_tool = defineTool({
         name: 'send_file',
         description: '把本地图片发到当前微信聊天（只支持 jpg/png/gif/webp 等图片；文件暂不支持）。用户说"发我""发过来""截图给我"时用它。',
         parameters: {
@@ -675,7 +710,16 @@ export class InboundCoordinator {
             return { ok: false, text: `发送失败：${String(error).slice(0, 160)}` }
           }
         },
-      }))
+      })
+      const current = agent.ctx.tools.get('send_file', agent)
+      if (current === undefined) {
+        agent.ctx.tools.register(media_tool)
+      } else {
+        // 注册表保留原定义对象；复用其 effect，仅刷新发送目标与模型可见说明。
+        current.description = media_tool.description
+        current.parameters = media_tool.parameters
+        current.execute = media_tool.execute
+      }
     }
     // 记住这条消息（换模型后要重做它）；只记文本，不落盘
     this.options.on_user_message?.(session_key, message.user_id, text)
@@ -693,6 +737,7 @@ export class InboundCoordinator {
       content,
       source: { kind: 'plugin', plugin: 'dsh-webhook-weixin', form: 'notice', summary: '微信消息' },
     })
+    if (this.disposed) return
     const steering = agent.status !== 'idle'
     if (steering) {
       agent.steer(incoming)
@@ -773,19 +818,16 @@ export class InboundCoordinator {
             delivery_id: record.delivery_id, user_id: record.user_id, from_status: record.status,
           })
           // process_message 内部自会落状态（injected / failed_*），此处不再代写。
-          await this.process_message(message)
+          await this.enqueue_for_user(message)
           reinjected += 1
           continue
         }
       }
-      // 没有可恢复载荷（v3 之前登记的历史记录）：无法安全重投，
-      // 只能在确知会话时补标记收尾，避免重复投递同一条用户消息。
-      const session_id = record.session_id ?? this.options.store.get_session_id(record.user_id)
-      if (session_id !== undefined) {
-        this.options.store.update_delivery(record.delivery_id, 'injected', { session_id, injected_at: Date.now() })
-      } else {
-        needs_reinject += 1
-      }
+      // 缺少原始载荷时不能以“有会话”冒充注入成功；保留明确的失败事实。
+      needs_reinject += 1
+      this.options.store.update_delivery(record.delivery_id, 'failed_terminal', {
+        last_error: '无法恢复：入站载荷缺失，未重新执行',
+      })
     }
     probe('inbound', 'recover.done', { unfinished: unfinished.length, needs_reinject, reinjected })
     return { recovered: unfinished.length, needs_reinject }

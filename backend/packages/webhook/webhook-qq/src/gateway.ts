@@ -1,202 +1,203 @@
-﻿/**
- * QQ 机器人 WebSocket 网关（官方 v2）。
- *
- * 流程：`GET /gateway` 取 wss 地址 → 连上后收 `op=10 Hello`（带心跳间隔）→
- * 发 `op=2 Identify`（`token = "QQBot <access_token>"` + intents + shard）→
- * 按间隔发 `op=1 心跳` → 收 `op=0 Dispatch` 业务事件。
- *
- * 断线处理：`op=7 Reconnect` 或 socket 关闭 → 指数退避重连，优先 `op=6 Resume`
- * （带上次的 session_id + seq，平台会补发漏掉的事件）。
- *
- * @module dsh-webhook-qq/gateway
+/**
+ * QQ WebSocket 网关：管理连接代次、握手超时、心跳确认和退避重连。
+ * 参数：token 取令牌，on_event 处理业务，on_health 报告活性；
+ * baseUrl 默认官方地址，intents 默认群与私聊，handshake_timeout_ms 默认 30000。
  */
-
-/** 网关下发的一条事件（`op=0` 的 payload）。 */
 export interface QqGatewayEvent {
-  /** 事件类型，如 `C2C_MESSAGE_CREATE` / `GROUP_AT_MESSAGE_CREATE` */
   readonly t: string
-  /** 事件数据 */
   readonly d: Record<string, unknown>
 }
-
-/** 网关配置。 */
 export interface QqGatewayOptions {
-  /** 取 access_token（过期自动刷新） */
   readonly token: () => Promise<string>
-  /** 订阅的 intents 位图（默认 1 << 25 = GROUP_AND_C2C_EVENT） */
   readonly intents?: number
-  /** 接口基址 */
   readonly baseUrl?: string
-  /** 收到业务事件 */
   readonly on_event: (event: QqGatewayEvent) => void
-  /** 日志（连接/重连/错误） */
   readonly log?: (message: string) => void
+  readonly handshake_timeout_ms?: number
+  readonly on_health?: (state: { phase: string; expires_at: number }) => void
 }
 
-/** 默认订阅：群 @ + C2C 单聊消息。 */
-const DEFAULT_INTENTS = 1 << 25
-
-/** WebSocket 网关客户端。 */
 export class QqGateway {
   private socket: WebSocket | undefined
   private heartbeat: ReturnType<typeof setInterval> | undefined
+  private handshake: ReturnType<typeof setTimeout> | undefined
+  private reconnect: ReturnType<typeof setTimeout> | undefined
+  private controller: AbortController | undefined
   private seq = 0
   private sessionId = ''
-  private stopped = false
+  private stopped = true
   private attempt = 0
-  /** 连续被平台踢（op=7）的时间戳；短时间内太多就冷却，避免无限重连战争。 */
-  private kickTimes: number[] = []
-  /** 冷却截止时间（毫秒时间戳）；期间不重连。 */
-  private cooldownUntil = 0
+  private generation = 0
+  private awaiting_ack = false
+  private ready = false
+  private interval_ms = 30_000
+  private kick_times: number[] = []
+  private cooldown_until = 0
 
+  /** options 指定鉴权和事件处理；构造不联网。 */
   constructor(private readonly options: QqGatewayOptions) {}
 
-  /** 启动（立即连接，断线自动重连）。 */
+  /** 无参数；幂等启动一个连接生命周期。 */
   start(): void {
+    if (!this.stopped) return
     this.stopped = false
     void this.connect()
   }
 
-  /** 停止（不再重连）。 */
+  /** 无参数；取消资源并使旧异步回调失效。 */
   stop(): void {
     this.stopped = true
-    if (this.heartbeat !== undefined) clearInterval(this.heartbeat)
-    this.heartbeat = undefined
-    try { this.socket?.close() } catch { /* ignore */ }
-    this.socket = undefined
+    this.generation++
+    this.clear_connection()
+    this.ready = false
+    if (this.reconnect !== undefined) clearTimeout(this.reconnect)
+    this.reconnect = undefined
+    this.health('stopped')
   }
 
-  /** 建一次连接；失败就按退避重试。 */
+  /** phase 为阶段；以实际心跳周期计算健康证据有效期。 */
+  private health(phase: string): void {
+    this.options.on_health?.({ phase, expires_at: Date.now() + Math.max(30_000, this.interval_ms * 2 + 5_000) })
+  }
+
+  /** 无参数；释放连接资源，不负责重连。 */
+  private clear_connection(): void {
+    if (this.heartbeat !== undefined) clearInterval(this.heartbeat)
+    if (this.handshake !== undefined) clearTimeout(this.handshake)
+    this.heartbeat = undefined
+    this.handshake = undefined
+    this.controller?.abort()
+    this.controller = undefined
+    const socket = this.socket
+    this.socket = undefined
+    try { socket?.close() } catch (error) { this.options.log?.(`gateway 关闭失败：${String(error).slice(0, 80)}`) }
+  }
+
+  /** gen 为连接代次，reason 为原因；当前连接最多安排一个重连。 */
+  private fail_connection(gen: number, reason: string): void {
+    if (this.stopped || gen !== this.generation) return
+    this.generation++
+    this.ready = false
+    this.clear_connection()
+    this.health('reconnecting')
+    const delay = Math.max(this.cooldown_until - Date.now(), Math.min(30_000, 1_000 * 2 ** Math.min(this.attempt++, 5)))
+    this.options.log?.(`gateway ${reason}，${Math.round(delay / 1000)}s 后重连`)
+    if (this.reconnect !== undefined) clearTimeout(this.reconnect)
+    this.reconnect = setTimeout(() => {
+      this.reconnect = undefined
+      if (!this.stopped) void this.connect()
+    }, delay)
+  }
+
+  /** 无参数；令牌、取地址、WebSocket 握手共用同一取消与超时边界。 */
   private async connect(): Promise<void> {
     if (this.stopped) return
-    const log = this.options.log ?? ((): void => {})
+    const gen = ++this.generation
+    const live = (): boolean => !this.stopped && gen === this.generation
+    this.controller = new AbortController()
+    const signal = this.controller.signal
+    this.health('connecting')
+    this.handshake = setTimeout(() => this.fail_connection(gen, '握手超时'), this.options.handshake_timeout_ms ?? 30_000)
     try {
-      const base = this.options.baseUrl ?? 'https://api.bot.qq.com'
       const token = await this.options.token()
-      const response = await fetch(`${base}/gateway`, {
-        headers: { Authorization: `QQBot ${token}` },
-        signal: AbortSignal.timeout(15_000),
+      if (!live()) return
+      const response = await fetch(`${this.options.baseUrl ?? 'https://api.bot.qq.com'}/gateway`, {
+        headers: { Authorization: `QQBot ${token}` }, signal,
       })
       if (!response.ok) throw new Error(`GET /gateway HTTP ${response.status}`)
       const body = await response.json() as { url?: string }
-      if (typeof body.url !== 'string' || body.url === '') throw new Error('GET /gateway 没返回 url')
-
+      if (!live()) return
+      if (!body.url) throw new Error('GET /gateway 没返回 url')
       const socket = new WebSocket(body.url)
       this.socket = socket
-      socket.addEventListener('open', () => {
-        log('gateway 已连接')
+      socket.addEventListener('open', () => { if (live()) this.options.log?.('gateway 已连接') })
+      socket.addEventListener('message', event => {
+        if (!live()) return
+        void this.handle_frame(String(event.data), gen).catch(error => this.fail_connection(gen, `处理帧失败：${String(error).slice(0, 120)}`))
       })
-      socket.addEventListener('message', (event: MessageEvent) => {
-        void this.handle_frame(typeof event.data === 'string' ? event.data : String(event.data))
-      })
-      socket.addEventListener('close', () => {
-        if (this.heartbeat !== undefined) clearInterval(this.heartbeat)
-        this.heartbeat = undefined
-        if (this.stopped) return
-        const backoff = Math.min(30_000, 1_000 * 2 ** this.attempt)
-        const cooldown = Math.max(0, this.cooldownUntil - Date.now())
-        const delay = Math.max(backoff, cooldown)
-        this.attempt += 1
-        log(`gateway 断开，${Math.round(delay / 1000)}s 后重连（第 ${this.attempt} 次）`)
-        setTimeout(() => { void this.connect() }, delay)
-      })
-      socket.addEventListener('error', () => {
-        // close 事件会随后触发，这里只记录
-        log('gateway 连接错误（等 close 后重连）')
-      })
+      socket.addEventListener('close', () => this.fail_connection(gen, '断开'))
+      socket.addEventListener('error', () => this.fail_connection(gen, '连接错误'))
     } catch (error) {
-      if (this.stopped) return
-      const delay = Math.min(30_000, 1_000 * 2 ** this.attempt)
-      this.attempt += 1
-      log(`gateway 连接失败：${String(error).slice(0, 120)}；${Math.round(delay / 1000)}s 后重试`)
-      setTimeout(() => { void this.connect() }, delay)
+      this.fail_connection(gen, `连接失败：${String(error).slice(0, 120)}`)
     }
   }
 
-  /** 处理一帧：hello / dispatch / 心跳确认 / 重连 / 失效会话。 */
-  private async handle_frame(raw: string): Promise<void> {
-    const log = this.options.log ?? ((): void => {})
+  /** raw 为协议帧，gen 为连接代次；确认和业务事件只作用于当前连接。 */
+  private async handle_frame(raw: string, gen = this.generation): Promise<void> {
+    if (this.stopped || gen !== this.generation) return
     let frame: { op?: number; d?: unknown; s?: number; t?: string }
-    try {
-      frame = JSON.parse(raw) as typeof frame
-    } catch {
-      return
-    }
+    try { frame = JSON.parse(raw) as typeof frame } catch { return }
     switch (frame.op) {
       case 10: {
-        const interval = Number((frame.d as { heartbeat_interval?: number } | undefined)?.heartbeat_interval ?? 30_000)
-        this.start_heartbeat(interval)
-        await this.identify()
+        const interval = Number((frame.d as { heartbeat_interval?: number })?.heartbeat_interval ?? 30_000)
+        if (!Number.isFinite(interval) || interval < 1_000) throw new Error('心跳间隔无效')
+        this.start_heartbeat(interval, gen)
+        await this.identify(gen)
         return
       }
       case 11:
+        this.awaiting_ack = false
+        this.health(this.ready ? 'healthy' : 'connecting')
         return
-      case 0: {
+      case 0:
         if (typeof frame.s === 'number') this.seq = frame.s
-        const kind = frame.t
-        if (kind === 'READY') {
-          const session = (frame.d as { session_id?: string } | undefined)?.session_id
-          if (typeof session === 'string') this.sessionId = session
+        if (frame.t === 'READY' || frame.t === 'RESUMED') {
+          const id = (frame.d as { session_id?: string })?.session_id
+          if (id) this.sessionId = id
+          if (this.handshake !== undefined) clearTimeout(this.handshake)
+          this.handshake = undefined
+          this.ready = true
           this.attempt = 0
-          log('gateway READY')
-          return
-        }
-        if (kind === 'C2C_MESSAGE_CREATE' || kind === 'GROUP_AT_MESSAGE_CREATE') {
-          this.options.on_event({ t: kind, d: (frame.d ?? {}) as Record<string, unknown> })
+          this.health('ready')
+          this.options.log?.('gateway READY')
+        } else if (frame.t === 'C2C_MESSAGE_CREATE' || frame.t === 'GROUP_AT_MESSAGE_CREATE') {
+          this.options.on_event({ t: frame.t, d: (frame.d ?? {}) as Record<string, unknown> })
         }
         return
-      }
-      case 7: {
-        log('gateway 要求重连（op=7），清空会话后重新 identify')
+      case 7:
+        this.kick_times = this.kick_times.filter(at => Date.now() - at < 600_000)
+        this.kick_times.push(Date.now())
+        if (this.kick_times.length >= 5) {
+          this.cooldown_until = Date.now() + 300_000
+          this.kick_times = []
+        }
+        this.fail_connection(gen, '要求重连（op=7）')
+        return
+      case 9:
         this.sessionId = ''
         this.seq = 0
-        // 短时间内被连续踢：说明旧连接还挂在平台侧，继续每秒重连只会互相踢。
-        // 冷却 5 分钟，让平台把僵尸会话清掉，再重新 identify。
-        const now = Date.now()
-        this.kickTimes = this.kickTimes.filter(at => now - at < 10 * 60 * 1000)
-        this.kickTimes.push(now)
-        if (this.kickTimes.length >= 5) {
-          this.cooldownUntil = now + 5 * 60 * 1000
-          this.kickTimes = []
-          log('gateway 连续被踢 5 次，冷却 5 分钟后再连（避免重连战争）')
-        }
-        try { this.socket?.close() } catch { /* ignore */ }
+        this.fail_connection(gen, '会话失效（op=9）')
         return
-      }
-      case 9: {
-        log('gateway 会话失效（op=9），重新 identify')
-        this.sessionId = ''
-        this.seq = 0
-        await this.identify()
-        return
-      }
       default:
         return
     }
   }
 
-  /** 启动心跳（d 带上次的 seq）。 */
-  private start_heartbeat(interval: number): void {
+  /** interval 为心跳周期，gen 为连接代次；确认超时立即废弃旧连接。 */
+  private start_heartbeat(interval: number, gen: number): void {
     if (this.heartbeat !== undefined) clearInterval(this.heartbeat)
+    this.interval_ms = interval
+    this.awaiting_ack = false
     const send = (): void => {
+      if (this.stopped || gen !== this.generation) return
+      if (this.awaiting_ack) { this.fail_connection(gen, '心跳确认超时'); return }
       try {
-        this.socket?.send(JSON.stringify({ op: 1, d: this.seq }))
-      } catch { /* 连接已断，close 会接管重连 */ }
+        if (this.socket?.readyState !== WebSocket.OPEN) throw new Error('socket 未打开')
+        this.socket.send(JSON.stringify({ op: 1, d: this.seq }))
+        this.awaiting_ack = true
+      } catch (error) { this.fail_connection(gen, `心跳发送失败：${String(error).slice(0, 80)}`) }
     }
     send()
-    this.heartbeat = setInterval(send, Math.max(5_000, interval))
+    if (!this.stopped && gen === this.generation) this.heartbeat = setInterval(send, interval)
   }
 
-  /** 发 identify / resume。 */
-  private async identify(): Promise<void> {
+  /** gen 为所属连接代次；取令牌后再核验代次，防止 stop 后复活。 */
+  private async identify(gen: number): Promise<void> {
     const token = await this.options.token()
+    if (this.stopped || gen !== this.generation) return
     const payload = this.sessionId === ''
-      ? { op: 2, d: { token: `QQBot ${token}`, intents: this.options.intents ?? DEFAULT_INTENTS, shard: [0, 1], properties: {} } }
+      ? { op: 2, d: { token: `QQBot ${token}`, intents: this.options.intents ?? 1 << 25, shard: [0, 1], properties: {} } }
       : { op: 6, d: { token: `QQBot ${token}`, session_id: this.sessionId, seq: this.seq } }
-    try {
-      this.socket?.send(JSON.stringify(payload))
-    } catch (error) {
-      (this.options.log ?? ((): void => {}))(`gateway 发送 ${this.sessionId === '' ? 'identify' : 'resume'} 失败：${String(error).slice(0, 100)}`)
-    }
+    this.socket?.send(JSON.stringify(payload))
   }
 }
