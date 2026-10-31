@@ -87,6 +87,11 @@ class videoDownloader:
         if domain is None:
             return None
         out = ROOT / "runtime" / "cookies" / f"{domain}.txt"
+        if os.environ.get("SYNLOVE_SERVICE_WORKER") == "1":
+            # 无头服务器不弹登录窗；由管理员预先提供服务器自己的cookie文件。
+            if out.is_file() and out.stat().st_size:
+                return str(out)
+            raise loginRequired(f"{domain} 缺少服务端cookie，请预先配置，不会打开本机浏览器")
         check = subprocess.run(
             [NODE, str(EDGE_SESSION), "--check", f"--domain={domain}", f"--out={out}"],
             cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -113,12 +118,19 @@ class videoDownloader:
         """下载/接收视频，返回本地绝对路径。"""
         if Path(target).is_file():
             return str(Path(target).resolve())
-        self._ensure()
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
         cookie_file = None
         if self._needs_login(target):
             cookie_file = self._cookie_file(target)
+        if os.environ.get("SYNLOVE_SERVICE_WORKER") == "1":
+            # 下载属于视频服务内部步骤，不再唤起另一个本机8088常驻服务。
+            from services.ytdlpService import download
+            files = download(target, str(self.out_dir), False, None, cookie_file)
+            if not files:
+                raise RuntimeError("下载完成但没有返回文件")
+            return str(Path(files[0]).resolve())
+        self._ensure()
 
         payload = {"url": target, "outDir": str(self.out_dir)}
         if cookie_file:

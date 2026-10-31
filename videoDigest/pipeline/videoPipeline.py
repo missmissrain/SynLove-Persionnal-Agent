@@ -2,11 +2,12 @@
 
 设计取舍：
 - 每一步都可单独失败（ASR 空、VLM 失败），只要视频在就能出报表；
-- 显存按阶段让位：ASR 用 whisper（约 1GB），跑完立刻 /unload，再唤醒 Gemma 做 VLM；
+- ASR 与 VLM 经统一配置调用；共享模型的空闲释放由服务负责，不由视频任务强制卸载；
 - 全程前台打印步骤与耗时，便于 cmd 里看进度。
 """
 
 import io
+import os
 import sys
 import time
 from pathlib import Path
@@ -34,11 +35,17 @@ class videoPipeline:
         paths = config.get("paths", {})
         self.media_dir = self.root / str(paths.get("media", "runtime/videoDigest"))
         self.report_dir = self.root / str(paths.get("reports", "runtime/reports"))
+        if os.environ.get("SYNLOVE_VIDEO_WORK_DIR"):
+            work = Path(os.environ["SYNLOVE_VIDEO_WORK_DIR"]).resolve()
+            self.media_dir = work / "media"
+            self.report_dir = work / "reports"
 
     def run(self, target, frames=None, language=None):
         """执行整条链路，返回报表路径与摘要。"""
         started = time.time()
         frames = int(frames or self.config.get("frames", 20))
+        if not 1 <= frames <= 120:
+            raise ValueError("抽帧数必须为1至120")
         whisper_cfg = dict(self.config.get("whisper", {}))
         if language:
             whisper_cfg["language"] = language
@@ -61,8 +68,6 @@ class videoPipeline:
             asr = recognizer.transcribe(wav_path)
         except Exception as error:  # noqa: BLE001
             print(f"[ASR] 失败（继续出报表）：{type(error).__name__}: {error}", flush=True)
-        finally:
-            recognizer.unload()
 
         print("[4/5] 抽帧 + 画面描述", flush=True)
         sampler = frameSampler(self.media_dir / "frames", self.config.get("frameWidth", 640))

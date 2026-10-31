@@ -13,6 +13,7 @@
 """
 
 import sys
+import os
 import time
 from pathlib import Path
 
@@ -24,6 +25,10 @@ except AttributeError:  # 极老的解释器没有 reconfigure
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
+sys.path.insert(0, str(ROOT))
+if __name__ == "__main__" and os.environ.get("SYNLOVE_SERVICE_WORKER") != "1":
+    from microServices.ServiceCli import ServiceCli
+    sys.exit(ServiceCli("digest", ROOT).run(sys.argv[1:]))
 sys.path.insert(0, str(HERE))
 
 from config.configLoader import configLoader        # noqa: E402
@@ -34,7 +39,7 @@ from store.newsStore import newsStore              # noqa: E402
 from filter.gemmaFilter import gemmaFilter         # noqa: E402
 from push.qqPush import qqPush                      # noqa: E402
 
-LOG_PATH = ROOT / "runtime" / "news-digest.log"
+LOG_PATH = Path(os.environ.get("SYNLOVE_DIGEST_LOG") or ROOT / "runtime" / "news-digest.log")
 
 
 def log(message):
@@ -66,7 +71,7 @@ def main():
     browser = config.get("browser")
     chrome = browserSource(ROOT, browser) if browser else None
     rsshub = rsshubSource(config.get("rsshubBase") or "http://127.0.0.1:1200")
-    store = newsStore(ROOT / "runtime" / "newsDigest.db")
+    store = newsStore(Path(os.environ.get("SYNLOVE_DIGEST_DB") or ROOT / "runtime" / "newsDigest.db"))
     try:
         total_fresh = []
         for item_source in config.get("sources", []):
@@ -118,6 +123,9 @@ def main():
 
         if dry_run:
             log("--dry-run：不发送")
+            return 0
+        if config.get("push").get("channel") != "qq":
+            log("新闻推送通道未启用，本轮仅生成预览")
             return 0
 
         pusher = qqPush(

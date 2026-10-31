@@ -11,6 +11,7 @@
 import argparse
 import io
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -20,6 +21,9 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(ROOT))
+if __name__ == "__main__" and os.environ.get("SYNLOVE_SERVICE_WORKER") != "1":
+    from microServices.ServiceCli import ServiceCli
+    sys.exit(ServiceCli("video", ROOT).run(sys.argv[1:]))
 
 from pipeline.videoPipeline import videoPipeline  # noqa: E402
 from steps.videoDownloader import loginRequired  # noqa: E402
@@ -44,7 +48,7 @@ def main(argv):
         md_path, summary = pipeline.run(target, frames=args.frames, language=args.language)
     except loginRequired as error:
         print(f"需要登录：{error}", flush=True)
-        print("→ 已打开登录窗口；登录完成后重新运行本命令即可。", flush=True)
+        print("→ 请在服务端配置该站点的登录凭据后重试。", flush=True)
         return 3
     except Exception as error:  # noqa: BLE001
         print(f"流水线失败：{type(error).__name__}: {error}", flush=True)

@@ -18,6 +18,9 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from services.ServiceRegistry import ServiceRegistry
+from services.ServiceClient import ServiceClient
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -27,10 +30,8 @@ class reportBuilder:
 
     def __init__(self, config, out_dir):
         """config：顶层配置；out_dir：报表目录。"""
-        gemma = config.get("gemma", {})
-        self.endpoint = str(gemma.get("endpoint", "http://127.0.0.1:8080/v1/chat/completions"))
-        self.model = str(gemma.get("model", "gemma-4-E4B-it-Q4_K_M"))
-        self.timeout = int(gemma.get("timeoutSeconds", 240))
+        self.client = ServiceClient(ServiceRegistry().get_service("llm"))
+        self.model = self.client.config["model"]
         self.out_dir = Path(out_dir)
 
     def _ask(self, prompt, max_tokens=260):
@@ -41,13 +42,8 @@ class reportBuilder:
             "temperature": 0.3,
             "max_tokens": max_tokens,
         }
-        request = urllib.request.Request(
-            self.endpoint, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json"}, method="POST",
-        )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
+            data = self.client.chat(payload)
             return str(data["choices"][0]["message"]["content"]).strip()
         except Exception as error:  # noqa: BLE001
             print(f"[报表] 摘要生成失败：{type(error).__name__}: {error}", flush=True)

@@ -31,7 +31,7 @@ TOOLS = [{
         "type": "object",
         "properties": {
             "pathOrUrl": {"type": "string", "description": "视频链接或本地文件绝对路径"},
-            "frames": {"type": "integer", "description": "抽多少帧，默认 20"},
+            "frames": {"type": "integer", "minimum": 1, "maximum": 120, "description": "抽多少帧，默认20，最多120"},
             "language": {"type": "string", "description": "ASR 语言，如 zh / en；不填自动"},
         },
         "required": ["pathOrUrl"],
@@ -65,9 +65,11 @@ def run_digest(arguments):
         elif line.startswith("报表："):
             report = line[3:].strip()
         elif line.startswith("需要登录"):
-            return f"这个站点需要登录：{line}。请在电脑上运行 tools\\loginSite.cmd <域名> 登录后再试。"
+            raise RuntimeError(f"服务端站点需要登录：{line}。请在服务所在机器配置登录凭据后重试。")
     if result.returncode != 0 and report == "":
-        return f"视频分析失败（退出码 {result.returncode}）：\n{output[-600:]}"
+        raise RuntimeError(f"视频分析失败（退出码 {result.returncode}）：\n{output[-600:]}")
+    if not report or not Path(report).is_file():
+        raise RuntimeError("视频处理未生成可验证报表")
     return f"{summary}\n\n报表：{report}" if summary else f"已生成报表：{report}"
 
 
@@ -116,4 +118,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.path.insert(0, str(ROOT))
+    from microServices.ServiceMcpBridge import ServiceMcpBridge
+    ServiceMcpBridge("video", ROOT).run_stdio()

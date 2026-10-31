@@ -18,6 +18,9 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from services.ServiceRegistry import ServiceRegistry
+from services.ServiceClient import ServiceClient
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -115,9 +118,8 @@ class visionDescriber:
 
     def __init__(self, config):
         """config：gemma 段。"""
-        self.endpoint = str(config.get("endpoint", "http://127.0.0.1:8080/v1/chat/completions"))
-        self.model = str(config.get("model", "gemma-4-E4B-it-Q4_K_M"))
-        self.timeout = int(config.get("timeoutSeconds", 240))
+        self.client = ServiceClient(ServiceRegistry().get_service("llm"))
+        self.model = self.client.config["model"]
 
     def _ask(self, prompt, image_path):
         """单张拼图问一次模型，返回文本。"""
@@ -134,13 +136,8 @@ class visionDescriber:
             "temperature": 0.2,
             "max_tokens": 400,
         }
-        request = urllib.request.Request(
-            self.endpoint, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json"}, method="POST",
-        )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
+            data = self.client.chat(payload)
             return str(data["choices"][0]["message"]["content"]).strip()
         except Exception as error:  # noqa: BLE001
             print(f"[VLM] 拼图失败：{type(error).__name__}: {error}", flush=True)

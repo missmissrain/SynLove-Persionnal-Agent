@@ -25,6 +25,8 @@ class ServiceClient:
     def request(self, path, body=None, content_type=None, limit=MAX_AUDIO):
         """path 为 API 相对路径；body 为字节；limit 为完整响应字节上限；返回字节与 MIME。"""
         cfg = self.config
+        if cfg.get("management") == "disabled":
+            raise RuntimeError("服务已禁用")
         headers = {}
         if content_type:
             headers["Content-Type"] = content_type

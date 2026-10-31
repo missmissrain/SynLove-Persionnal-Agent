@@ -11,7 +11,24 @@ from urllib.parse import urlsplit
 
 
 class ServiceRegistry:
-    """管理 TTS、ASR、LLM 服务配置，密钥只从 apiKeyEnv 指定的环境变量读取。"""
+    """统一管理推理与业务端点；密钥只从 apiKeyEnv 指定的环境变量读取。"""
+
+    DEFAULTS = {
+        "core": {"port": 8790, "timeoutSeconds": 240},
+        "reminders": {"port": 8791, "timeoutSeconds": 60},
+        "digest": {"port": 8792, "timeoutSeconds": 900},
+        "video": {"port": 8793, "timeoutSeconds": 3600},
+        "history": {"port": 8794, "timeoutSeconds": 120},
+        "memory": {"port": 8797, "timeoutSeconds": 120},
+        "state": {"port": 8798, "timeoutSeconds": 120},
+        "qqstate": {"port": 8799, "timeoutSeconds": 120},
+        "observation": {"port": 8800, "timeoutSeconds": 120},
+        "session": {"port": 8801, "timeoutSeconds": 120},
+        "coding": {"port": 8795, "timeoutSeconds": 1800},
+        "crawler": {"port": 8796, "timeoutSeconds": 300},
+        "rsshub": {"port": 1200, "timeoutSeconds": 30},
+        "opencode": {"port": 4096, "timeoutSeconds": 60},
+    }
 
     def __init__(self, path=None):
         """path 为独立服务配置文件；未传时允许 SYNLOVE_SERVICE_CONFIG 覆盖默认路径。"""
@@ -22,8 +39,17 @@ class ServiceRegistry:
             raise ValueError("serviceConfig.version 必须是 1")
 
     def get_service(self, name):
-        """name 为 tts/asr/llm；校验并返回服务副本，拒绝带内嵌凭据或非法协议的地址。"""
-        cfg = dict(self.data["services"][name])
+        """name为已登记服务名；校验并返回副本，拒绝带内嵌凭据或非法协议的地址。"""
+        defaults = self.DEFAULTS.get(name)
+        cfg = ({"baseURL": f"http://127.0.0.1:{defaults['port']}/v1",
+                "management": "managed", "timeoutSeconds": defaults["timeoutSeconds"],
+                "apiKeyEnv": "SYNLOVE_" + name.upper() + "_API_KEY",
+                "healthPath": "/health"} if defaults else {})
+        if name in ("rsshub", "opencode"):
+            cfg["baseURL"] = cfg["baseURL"].removesuffix("/v1")
+        cfg.update(self.data["services"].get(name, {}))
+        if not cfg:
+            raise ValueError(f"未知服务 {name}")
         prefix = "SYNLOVE_" + name.upper()
         override = os.environ.get(prefix + "_BASE_URL")
         if override:
@@ -37,16 +63,19 @@ class ServiceRegistry:
             raise ValueError(f"{name} 的 baseURL 必须是无内嵌凭据的 HTTP(S) API 根地址")
         cfg["port"] = url.port or (443 if url.scheme == "https" else 80)
         cfg["host"] = url.hostname
-        if cfg["management"] not in ("managed", "external"):
-            raise ValueError(f"{name}.management 只允许 managed 或 external")
+        if cfg["management"] not in ("managed", "external", "disabled"):
+            raise ValueError(f"{name}.management 只允许 managed、external 或 disabled")
         if cfg["management"] == "managed" and url.hostname not in ("127.0.0.1", "localhost"):
             raise ValueError(f"{name} 托管服务必须使用回环地址；远程服务请设 external")
-        if cfg["management"] == "managed" and (url.scheme != "http" or url.path.rstrip("/") != "/v1"):
+        expected_path = "" if name in ("rsshub", "opencode") else "/v1"
+        if cfg["management"] == "managed" and (url.scheme != "http" or url.path.rstrip("/") != expected_path):
             raise ValueError(f"{name} 本机托管服务使用 http://回环地址:端口/v1；代理地址请设 external")
         cfg["timeoutSeconds"] = float(cfg.get("timeoutSeconds", 240))
         if not 0 < cfg["timeoutSeconds"] <= 3600:
             raise ValueError(f"{name}.timeoutSeconds 必须在 (0, 3600] 内")
-        if not isinstance(cfg.get("model"), str) or not cfg["model"].strip():
+        if not 1 <= float(cfg.get("cacheRetentionDays", 7)) <= 365:
+            raise ValueError(f"{name}.cacheRetentionDays必须在1至365天之间")
+        if name in ("tts", "asr", "llm") and (not isinstance(cfg.get("model"), str) or not cfg["model"].strip()):
             raise ValueError(f"{name}.model 不能为空")
         return cfg
 
@@ -62,6 +91,39 @@ class ServiceRegistry:
         env["SYNLOVE_LLM_TIMEOUT_MS"] = str(int(cfg["timeoutSeconds"] * 1000))
         if cfg["management"] == "external":
             env["DSH_GEMMA_MIN_FREE_VRAM_MB"] = "0"
+        for name in self.DEFAULTS:
+            service = self.get_service(name)
+            prefix = "SYNLOVE_" + name.upper()
+            env[prefix + "_BASE_URL"] = service["baseURL"]
+            env[prefix + "_MANAGEMENT"] = service["management"]
+            if name == "session":
+                env["SYNLOVE_SESSION_TIMEOUT_MS"] = str(int(service["timeoutSeconds"] * 1000))
+            if name == "qqstate":
+                mode = str(service.get("mode", "local")).strip().lower()
+                if mode not in ("local", "remote"):
+                    raise ValueError("qqstate.mode 只允许 local 或 remote")
+                env["SYNLOVE_QQ_STATE_MODE"] = mode
+            if name == "memory":
+                mode = str(service.get("mode", "local")).strip().lower()
+                if mode not in ("local", "remote"):
+                    raise ValueError("memory.mode 只允许 local 或 remote")
+                env["SYNLOVE_MEMORY_TIMELINE_MODE"] = mode
+            if name == "state":
+                mode = str(service.get("mode", "local")).strip().lower()
+                if mode not in ("local", "remote"):
+                    raise ValueError("state.mode 只允许 local 或 remote")
+                env["SYNLOVE_STATE_MODE"] = mode
+            if name == "observation":
+                mode = str(service.get("mode", "local")).strip().lower()
+                if mode not in ("local", "remote"):
+                    raise ValueError("observation.mode 只允许 local 或 remote")
+                env["SYNLOVE_OBSERVATION_MODE"] = mode
+            if name == "session":
+                mode = str(service.get("mode", "local")).strip().lower()
+                if mode not in ("local", "remote"):
+                    raise ValueError("session.mode 只允许 local 或 remote")
+                env["SYNLOVE_SESSION_MODE"] = mode
+        env["OPENCODE_SERVER_URL"] = self.get_service("opencode")["baseURL"]
 
     def apply_model_config(self, config, env=None):
         """config 为已合并的模型配置；仅覆盖 llm.provider 指定的本地能力提供方。"""

@@ -439,9 +439,17 @@ def ensure_gemma_server(env: dict[str, str]) -> str:
     只有当默认模型（或任一 provider）指向 127.0.0.1:GEMMA_SERVER_PORT 时才拉起，
     避免用云端模型时白白吃显存。首次加载模型要几十秒，这里最多等 180 秒。
     """
+    from services.ServiceRegistry import ServiceRegistry
+    registry = ServiceRegistry()
+    cfg = registry.get_service("llm")
+    registry.apply_environment(env)
+    if cfg["management"] == "external":
+        return "external"
+    global GEMMA_SERVER_PORT
+    GEMMA_SERVER_PORT = cfg["port"]
     config = load_model_config()
-    local_needed = any("127.0.0.1:%d" % GEMMA_SERVER_PORT in str(p.get("baseURL", ""))
-                       for p in config.get("providers", {}).values())
+    registry.apply_model_config(config)
+    local_needed = cfg.get("provider", "gemma-local") in config.get("providers", {})
     if not local_needed:
         return "not_needed"
     binary = GEMMA_ROOT / "llama.cpp" / "build-ninja" / "bin" / "llama-server.exe"
@@ -474,7 +482,7 @@ def ensure_gemma_server(env: dict[str, str]) -> str:
     sleep_idle = os.environ.get("DSH_GEMMA_SLEEP_IDLE_SECONDS") or "120"
     args = [str(binary), "-m", str(model), "--host", "127.0.0.1", "--port", str(GEMMA_SERVER_PORT),
             "-c", "32768", "-ngl", "99", "--jinja", "--reasoning", "off", "-np", "1", "-fa", "on",
-            "--alias", "gemma-4-E4B-it-Q4_K_M", "--sleep-idle-seconds", str(sleep_idle)]
+            "--alias", str(cfg["model"]), "--sleep-idle-seconds", str(sleep_idle)]
     # 视觉投影器：加载后 Gemma 才能看图，用于"图片一句话描述"（写进时间线）。
     # 不加载它就只能处理纯文本。代价：+946MB 显存，且休眠时同样会被释放。
     if mmproj.is_file():
@@ -710,22 +718,19 @@ def clear_stuck_deliveries() -> None:
 
 
 def ensure_reminder_service(env: dict[str, str]) -> str:
-    """确保独立提醒服务常驻（每 30 秒轮询、到点 QQ 直推）。"""
-    pid_file = PROJECT_ROOT / "runtime" / "reminder.pid"
-    if pid_file.is_file():
-        try:
-            pid = int(pid_file.read_text(encoding="utf-8").strip())
-            if process_alive(pid):
-                return "already_running"
-        except (OSError, ValueError):
-            pass
-    process = spawn_silent(
-        [sys.executable, str(PROJECT_ROOT / "reminders" / "reminderService.py"), "--loop"],
-        PROJECT_ROOT, env, "reminder-service.log",
-    )
-    pid_file.parent.mkdir(parents=True, exist_ok=True)
-    pid_file.write_text(str(process.pid), encoding="utf-8")
-    return "started"
+    """确保提醒服务由统一 API 服务管理器托管，禁止再创建旧版轮询进程。"""
+    from microServices.ServiceManager import ServiceManager
+    ServiceManager(PROJECT_ROOT).ensure_service("reminders")
+    return "ready"
+
+
+def ensure_state_microservices() -> str:
+    """启动微信、QQ 和观测状态服务；每个服务只拥有自己的数据库和租约。"""
+    from microServices.ServiceManager import ServiceManager
+    manager = ServiceManager(PROJECT_ROOT)
+    for name in ("state", "qqstate", "observation"):
+        manager.ensure_service(name)
+    return "ready"
 
 
 def ensure_rsshub(env: dict[str, str]) -> str:
@@ -821,6 +826,7 @@ def main() -> int:
     server_state = ensure_opencode_server(env) if shutil.which(str(OPENCODE_BIN)) else "未安装（可选）"
     gemma_state = ensure_gemma_server(env) if env.get("SYNLOVE_LLM_MANAGEMENT") != "external" else "外部服务"
     reminder_state = ensure_reminder_service(env)
+    state_services = ensure_state_microservices()
     rsshub_state = ensure_rsshub(env)
     guard_state = ensure_guard_service(env)
 
@@ -854,6 +860,7 @@ def main() -> int:
     print("opencode_server=" + server_state + " url=" + OPENCODE_SERVER_URL)
     print("gemma_server=" + gemma_state + " port=" + str(GEMMA_SERVER_PORT))
     print("reminder_service=" + reminder_state)
+    print("state_services=" + state_services)
     print("guard_service=" + guard_state)
     print("rsshub=" + rsshub_state)
     print("dsh_harness_pid=" + str(harness.pid))

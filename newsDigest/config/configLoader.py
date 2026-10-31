@@ -12,6 +12,7 @@
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -48,7 +49,8 @@ class configLoader:
     def __init__(self, project_root, config_path=None):
         """project_root：项目根目录（用来解析相对路径）；config_path：配置文件，默认 config/newsDigest.json。"""
         self.root = Path(project_root)
-        self.path = Path(config_path) if config_path is not None else self.root / "newsDigest" / "config" / "newsDigest.json"
+        self.path = Path(config_path or os.environ.get("SYNLOVE_DIGEST_CONFIG") or
+                         self.root / "newsDigest" / "config" / "newsDigest.json")
         self.data = self._load()
 
     def _load(self):
@@ -56,6 +58,10 @@ class configLoader:
         if not self.path.exists():
             raise FileNotFoundError(f"配置文件不存在：{self.path}")
         raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from services.ServiceRegistry import ServiceRegistry
+        service = ServiceRegistry().get_service("llm")
+        rsshub = ServiceRegistry().get_service("rsshub")
         merged = json.loads(json.dumps(DEFAULT))
         for key, value in raw.items():
             if isinstance(value, dict) and isinstance(merged.get(key), dict):
@@ -63,6 +69,14 @@ class configLoader:
             else:
                 merged[key] = value
         browser = merged["browser"]
+        merged["rsshubBase"] = rsshub["baseURL"]
+        # 统一服务注册表拥有地址和模型；新闻配置保留业务生成参数。
+        merged["gemma"].update({
+            "endpoint": service["baseURL"] + "/chat/completions",
+            "model": service["model"],
+            "timeoutSeconds": service["timeoutSeconds"],
+            "apiKeyEnv": service.get("apiKeyEnv", ""),
+        })
         browser["extractorScript"] = str((self.root / browser["extractorScript"]).resolve())
         browser["profileDir"] = str((self.root / browser["profileDir"]).resolve())
         if not merged["interest"].strip():

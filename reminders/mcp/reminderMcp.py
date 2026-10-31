@@ -1,7 +1,6 @@
 """提醒工具（MCP stdio）：让欣爱能创建/查看/删除"到点必达"的提醒。
 
-为什么不用 harness 自带 schedule：那是会话内定时器，会话不活跃/重启后就不响
-（今天的吃药提醒就是这样丢的）。这里直接写独立提醒库，由后台服务轮询、QQ 直推。
+业务仅由独立提醒服务执行；直接运行本文件时是stdio→HTTP代理，不读写提醒数据库。
 
 工具：
     remind_add     text + (at | dailyAt | inSeconds)
@@ -26,7 +25,7 @@ import reminderService as svc  # noqa: E402
 TOOLS = [
     {
         "name": "remind_add",
-        "description": "创建一条到点必达的提醒（独立服务推送，重启发消息都不影响）。时间三选一：dailyAt='12:00' 每天；at='2026-10-27 12:00' 一次性；inSeconds=600 多少秒后。",
+        "description": "创建持久化提醒；到点由独立服务尝试推送，通道离线仍可能延迟。时间三选一：dailyAt='12:00'、at='2027-01-01 12:00'、inSeconds=600。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -76,10 +75,10 @@ def handle(message):
         try:
             if name == "remind_add":
                 reminder_id, next_at = svc.add(
-                    str(args.get("text", "")).strip(),
+                    args.get("text", ""),
                     at=args.get("at") or None,
                     daily=args.get("dailyAt") or None,
-                    in_seconds=args.get("inSeconds") or None,
+                    in_seconds=args.get("inSeconds"),
                 )
                 text = f"已创建提醒 #{reminder_id}，下次触发：{next_at}"
             elif name == "remind_list":
@@ -88,7 +87,7 @@ def handle(message):
                     f"#{row[0]} {row[2]} {'每天 ' + row[3] if row[3] else '一次性'} {row[1]}" for row in rows
                 ) or "（没有待触发的提醒）"
             elif name == "remind_delete":
-                text = "已删除" if svc.remove(int(args.get("id"))) else "没找到该提醒"
+                text = "已删除" if svc.remove(args.get("id")) else "没找到该提醒"
             else:
                 raise ValueError(f"未知工具：{name}")
             return {"jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": text}]}}
@@ -116,4 +115,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.path.insert(0, str(ROOT))
+    from microServices.ServiceMcpBridge import ServiceMcpBridge
+    ServiceMcpBridge("reminders", ROOT).run_stdio()

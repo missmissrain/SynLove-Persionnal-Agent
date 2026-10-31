@@ -14,6 +14,7 @@
 """
 
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -34,6 +35,10 @@ class gemmaFilter:
         self.endpoint = gemma_config["endpoint"]
         self.model = gemma_config["model"]
         self.timeout = int(gemma_config.get("timeoutSeconds", 240))
+        self.key_env = gemma_config.get("apiKeyEnv", "")
+        from services.ServiceRegistry import ServiceRegistry
+        from services.ServiceClient import ServiceClient
+        self.client = ServiceClient(ServiceRegistry().get_service("llm"))
 
     def build_prompt(self, items, interest, max_items, max_chars):
         """拼提示词：关注画像 + 标题清单 + 硬约束 + 一个范例（防止退化成"分点复述标题"）。"""
@@ -63,7 +68,7 @@ class gemmaFilter:
 请先在心里筛，然后直接输出简报。"""
 
     def run(self, items, interest, max_items=5, max_chars=300):
-        """调用模型并返回消息正文；失败重试一次，仍失败抛异常。"""
+        """按业务字数返回消息；网络异常最多重试一次，HTTP 鉴权或参数错误直接上抛。"""
         prompt = self.build_prompt(items, interest, max_items, max_chars)
         last_error = None
         for attempt in (1, 2):
@@ -93,12 +98,5 @@ class gemmaFilter:
             "temperature": 0.3,
             "max_tokens": 400,
         }
-        request = urllib.request.Request(
-            self.endpoint,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
+        data = self.client.chat(payload)
         return data["choices"][0]["message"]["content"]

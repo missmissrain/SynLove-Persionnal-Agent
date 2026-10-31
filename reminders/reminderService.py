@@ -30,7 +30,7 @@ from pathlib import Path
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 ROOT = Path(__file__).resolve().parent.parent
-DB = ROOT / "runtime" / "reminders.db"
+DB = Path(os.environ.get("SYNLOVE_REMINDERS_DB") or ROOT / "runtime" / "reminders.db")
 sys.path.insert(0, str(ROOT))
 
 SCHEMA = """
@@ -57,15 +57,26 @@ def connect():
 
 def add(text, at=None, daily=None, in_seconds=None):
     """新增提醒，返回 id 与下一次触发时间。"""
+    if not isinstance(text, str) or not text.strip() or len(text) > 4000:
+        raise ValueError("提醒内容必须为1至4000个字符")
+    if sum(value is not None for value in (at, daily, in_seconds)) != 1:
+        raise ValueError("at、daily、in_seconds必须且只能选择一个")
     now = time.time()
     if in_seconds is not None:
+        if isinstance(in_seconds, bool) or int(in_seconds) != in_seconds or not 1 <= in_seconds <= 31536000:
+            raise ValueError("相对提醒时间必须为1至31536000秒的整数")
         next_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now + int(in_seconds)))
     elif at is not None:
         try:
             next_at = time.strftime("%Y-%m-%d %H:%M:%S", time.strptime(at, "%Y-%m-%d %H:%M"))
         except ValueError:
-            next_at = at
+            raise ValueError("一次性时间必须为YYYY-MM-DD HH:MM") from None
+        if time.mktime(time.strptime(next_at, "%Y-%m-%d %H:%M:%S")) <= now:
+            raise ValueError("提醒时间必须在未来")
     elif daily is not None:
+        import re
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", daily):
+            raise ValueError("每日时间必须为HH:MM")
         hour, minute = [int(part) for part in daily.split(":")]
         candidate = time.strftime("%Y-%m-%d") + f" {hour:02d}:{minute:02d}:00"
         if time.mktime(time.strptime(candidate, "%Y-%m-%d %H:%M:%S")) <= now:
@@ -96,6 +107,8 @@ def pending():
 
 def remove(reminder_id):
     """删除提醒，返回是否删到。"""
+    if isinstance(reminder_id, bool) or not isinstance(reminder_id, int) or reminder_id < 1:
+        raise ValueError("提醒ID必须为正整数")
     conn = connect()
     cursor = conn.execute("DELETE FROM reminders WHERE id = ?", (int(reminder_id),))
     conn.commit()
@@ -118,10 +131,15 @@ def fire_due():
         conn.close()
         return 0
 
-    config = json.loads((ROOT / "newsDigest" / "config" / "newsDigest.json").read_text(encoding="utf-8-sig"))
+    path = Path(os.environ.get("SYNLOVE_REMINDERS_CONFIG") or ROOT / "reminders" / "config" / "reminderConfig.json")
+    if not path.is_file():
+        # 旧安装仅兼容读取；迁移命令会生成独立提醒配置，不再与新闻服务共享可变设置。
+        path = ROOT / "newsDigest" / "config" / "newsDigest.json"
+    config = json.loads(path.read_text(encoding="utf-8-sig"))
     openid = str((config.get("push") or {}).get("userOpenid") or "").strip()
+    enabled = (config.get("push") or {}).get("channel", "qq") == "qq"
     pusher = qqPush(ROOT / "config" / "secrets.json", openid,
-                    bool((config.get("push") or {}).get("allowWakeupFallback", True))) if openid else None
+                    bool((config.get("push") or {}).get("allowWakeupFallback", True))) if openid and enabled else None
 
     sent = 0
     for reminder_id, text, daily_at in due:
@@ -137,6 +155,9 @@ def fire_due():
         print(f"[提醒] #{reminder_id} {now} 推送{'成功' if ok else '失败'}：{text}（{detail}）", flush=True)
         if ok:
             sent += 1
+        else:
+            # 失败保留pending，不能把未投递的提醒当成已完成。
+            continue
         if daily_at:
             next_day = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + 86400))
             hour, minute = daily_at.split(":")
@@ -176,16 +197,16 @@ def main(argv):
         print("已删除" if remove(args.delete) else "没找到该提醒")
         return 0
     if args.loop:
-        print(f"[提醒] 服务启动，每 30 秒检查一次（库 {DB}）", flush=True)
-        while True:
-            try:
-                fire_due()
-            except Exception as error:  # noqa: BLE001
-                print(f"[提醒] 检查失败：{type(error).__name__}: {error}", flush=True)
-            time.sleep(30)
+        from microServices.ServiceManager import ServiceManager
+        ServiceManager(ROOT).ensure_service("reminders")
+        print("提醒已由独立API服务接管；此入口不再启动第二个轮询器。")
+        return 0
     parser.print_help()
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    if os.environ.get("SYNLOVE_SERVICE_WORKER") == "1":
+        sys.exit(main(sys.argv[1:]))
+    from microServices.ServiceCli import ServiceCli
+    sys.exit(ServiceCli("reminders", ROOT).run(sys.argv[1:]))
